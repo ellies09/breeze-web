@@ -465,7 +465,7 @@ async function toDisplayMessage(m, key) {
     return { id: m.id, mine, sentAt: m.sent_at, type: 'file', fileName, mediaPath: m.media_path };
   }
   if (m.type === 'voice') {
-    loadImage(m.id, m.media_path, key, 'audio/mp4'); // même mécanisme de cache/chargement que les images
+    loadImage(m.id, m.media_path, key, sniffAudioMimeType);
     return { id: m.id, mine, sentAt: m.sent_at, type: 'voice' };
   }
   if (m.type !== 'text') {
@@ -479,7 +479,19 @@ async function toDisplayMessage(m, key) {
   }
 }
 
-/** Télécharge + déchiffre un média (image/vocal) et publie son URL objet dans state.mediaUrls. */
+/**
+ * Détecte le vrai conteneur audio à partir des octets (Chrome enregistre en webm/opus, Safari/
+ * Android en mp4/AAC — impossible de le deviner à l'avance, il faut regarder le contenu réel).
+ */
+function sniffAudioMimeType(bytes) {
+  if (bytes[0] === 0x1a && bytes[1] === 0x45 && bytes[2] === 0xdf && bytes[3] === 0xa3) return 'audio/webm';
+  return 'audio/mp4';
+}
+
+/**
+ * Télécharge + déchiffre un média (image/vocal) et publie son URL objet dans state.mediaUrls.
+ * [mimeType] est soit une chaîne fixe, soit une fonction(bytes) → chaîne (détection par contenu).
+ */
 async function loadImage(messageId, mediaPath, key, mimeType = 'image/jpeg') {
   if (state.mediaUrls[messageId]) return;
   try {
@@ -487,7 +499,8 @@ async function loadImage(messageId, mediaPath, key, mimeType = 'image/jpeg') {
     if (error) throw error;
     const encBytes = new Uint8Array(await data.arrayBuffer());
     const plainBytes = await decryptRaw(key, encBytes);
-    const blob = new Blob([plainBytes], { type: mimeType });
+    const type = typeof mimeType === 'function' ? mimeType(plainBytes) : mimeType;
+    const blob = new Blob([plainBytes], { type });
     const url = URL.createObjectURL(blob);
     set({ mediaUrls: { ...state.mediaUrls, [messageId]: url } });
   } catch (_) {
