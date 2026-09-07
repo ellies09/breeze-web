@@ -1,5 +1,5 @@
-const CACHE = 'breeze-web-v2';
-const ASSETS = ['./', './index.html', './app.js?v=2', './tink-hpke.js', './manifest.webmanifest'];
+const CACHE = 'breeze-web-v3';
+const ASSETS = ['./', './index.html', './app.js?v=3', './tink-hpke.js', './manifest.webmanifest', './icon-192.png', './icon-512.png'];
 
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(ASSETS)));

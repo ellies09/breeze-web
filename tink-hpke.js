@@ -23,8 +23,12 @@ export function base64ToBytes(b64) {
 }
 
 export function bytesToBase64(bytes) {
+  // Par blocs (évite la concaténation caractère par caractère, coûteuse sur les gros fichiers).
+  const CHUNK = 0x8000;
   let s = '';
-  for (const b of bytes) s += String.fromCharCode(b);
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    s += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+  }
   return btoa(s);
 }
 
@@ -200,18 +204,35 @@ async function aesKeyFor(rawKey32) {
   return crypto.subtle.importKey('raw', rawKey32, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
 }
 
-/** Déchiffre un message (ou des octets bruts) chiffré avec la clé de conversation. */
-export async function decryptBytes(conversationKey, ciphertextB64) {
-  const bytes = base64ToBytes(ciphertextB64);
+/** Déchiffre des octets Tink bruts (déjà décodés) avec la clé de conversation. */
+export async function decryptRaw(conversationKey, bytes) {
   if (bytes[0] !== 1) throw new Error('Préfixe Tink inattendu.');
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const keyId = dv.getUint32(1, false);
-  if (keyId !== conversationKey.keyId) throw new Error("Ce message n'a pas été chiffré avec cette clé de conversation.");
+  if (keyId !== conversationKey.keyId) throw new Error("Ce contenu n'a pas été chiffré avec cette clé de conversation.");
   const iv = bytes.slice(5, 17);
   const ct = bytes.slice(17);
   const key = await aesKeyFor(conversationKey.rawKey);
   const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv, tagLength: 128 }, key, ct);
   return new Uint8Array(plain);
+}
+
+/** Chiffre des octets bruts avec la clé de conversation → octets Tink bruts (format TINK). */
+export async function encryptRaw(conversationKey, plainBytes) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const key = await aesKeyFor(conversationKey.rawKey);
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv, tagLength: 128 }, key, plainBytes));
+  const out = new Uint8Array(1 + 4 + 12 + ct.length);
+  out[0] = 1;
+  new DataView(out.buffer).setUint32(1, conversationKey.keyId, false);
+  out.set(iv, 5);
+  out.set(ct, 17);
+  return out;
+}
+
+/** Déchiffre un message (ou des octets bruts en base64) chiffré avec la clé de conversation. */
+export async function decryptBytes(conversationKey, ciphertextB64) {
+  return decryptRaw(conversationKey, base64ToBytes(ciphertextB64));
 }
 
 /** Déchiffre un message texte → chaîne UTF-8. */
@@ -221,15 +242,7 @@ export async function decryptMessage(conversationKey, ciphertextB64) {
 
 /** Chiffre des octets bruts avec la clé de conversation → base64 (format Tink TINK). */
 export async function encryptBytes(conversationKey, plainBytes) {
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const key = await aesKeyFor(conversationKey.rawKey);
-  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv, tagLength: 128 }, key, plainBytes));
-  const out = new Uint8Array(1 + 4 + 12 + ct.length);
-  out[0] = 1;
-  new DataView(out.buffer).setUint32(1, conversationKey.keyId, false);
-  out.set(iv, 5);
-  out.set(ct, 17);
-  return bytesToBase64(out);
+  return bytesToBase64(await encryptRaw(conversationKey, plainBytes));
 }
 
 /** Chiffre un message texte → base64. */

@@ -1,5 +1,7 @@
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
-import { restoreIdentityFromBackup, unwrapConversationKey, decryptMessage, encryptMessage } from './tink-hpke.js';
+import { restoreIdentityFromBackup, unwrapConversationKey, decryptMessage, encryptMessage, decryptRaw, encryptRaw } from './tink-hpke.js';
+
+const MEDIA_BUCKET = 'media';
 
 // Même projet Supabase que l'app Android — même cercle, mêmes comptes.
 const SUPABASE_URL = 'https://yywirxlbbydwsbviansf.supabase.co';
@@ -41,6 +43,7 @@ let state = {
   messageInput: '',
   sendBusy: false,
   sendError: null,
+  mediaUrls: {},         // messageId -> object URL (image déchiffrée), une fois prête
 };
 
 function set(patch) {
@@ -449,6 +452,10 @@ async function openConversation(convId) {
 
 async function toDisplayMessage(m, key) {
   const mine = m.sender_id === state.user.id;
+  if (m.type === 'image') {
+    loadImage(m.id, m.media_path, key);
+    return { id: m.id, mine, sentAt: m.sent_at, type: 'image' };
+  }
   if (m.type !== 'text') {
     return { id: m.id, mine, sentAt: m.sent_at, text: previewLabelFor(m) + ' (non affiché sur le web pour l’instant)' };
   }
@@ -457,6 +464,22 @@ async function toDisplayMessage(m, key) {
     return { id: m.id, mine, sentAt: m.sent_at, text };
   } catch (_) {
     return { id: m.id, mine, sentAt: m.sent_at, text: '🔒 (indéchiffrable)' };
+  }
+}
+
+/** Télécharge + déchiffre une image et publie son URL objet dans state.mediaUrls. */
+async function loadImage(messageId, mediaPath, key) {
+  if (state.mediaUrls[messageId]) return;
+  try {
+    const { data, error } = await supabase.storage.from(MEDIA_BUCKET).download(mediaPath);
+    if (error) throw error;
+    const encBytes = new Uint8Array(await data.arrayBuffer());
+    const plainBytes = await decryptRaw(key, encBytes);
+    const blob = new Blob([plainBytes], { type: 'image/jpeg' });
+    const url = URL.createObjectURL(blob);
+    set({ mediaUrls: { ...state.mediaUrls, [messageId]: url } });
+  } catch (_) {
+    set({ mediaUrls: { ...state.mediaUrls, [messageId]: 'error' } });
   }
 }
 
@@ -494,16 +517,16 @@ function renderConversation() {
         msgs.length === 0 ? `<div class="empty">Aucun message. Écris le premier — il sera chiffré de bout en bout. 🔒</div>` :
         msgs.map((m) => `
           <div style="align-self:${m.mine ? 'flex-end' : 'flex-start'};max-width:75%;">
-            <div style="background:${m.mine ? 'var(--green)' : '#fff'};color:${m.mine ? '#fff' : 'var(--ink)'};padding:9px 13px;border-radius:14px;font-size:14px;border:${m.mine ? 'none' : '1px solid #e5e0d5'};">
-              ${escapeHtml(m.text)}
-            </div>
+            ${renderBubbleContent(m)}
             <div style="font-size:10px;color:var(--sage);margin-top:2px;text-align:${m.mine ? 'right' : 'left'};">${timeLabel(m.sentAt)}</div>
           </div>
         `).join('')
       }
     </div>
     ${state.sendError ? `<div class="error" style="padding:0 16px;">${escapeHtml(state.sendError)}</div>` : ''}
-    <form id="sendForm" style="display:flex;gap:8px;padding:10px 16px calc(10px + env(safe-area-inset-bottom));background:#fff;border-top:1px solid #e5e0d5;">
+    <form id="sendForm" style="display:flex;gap:8px;align-items:center;padding:10px 16px calc(10px + env(safe-area-inset-bottom));background:#fff;border-top:1px solid #e5e0d5;">
+      <input type="file" id="imageInput" accept="image/*" style="display:none;" />
+      <button type="button" id="attachBtn" style="background:none;border:none;font-size:22px;cursor:pointer;padding:4px;" ${state.sendBusy ? 'disabled' : ''}>📷</button>
       <input type="text" id="messageInput" placeholder="Message chiffré…" autocomplete="off"
              value="${escapeHtml(state.messageInput)}" style="flex:1;padding:10px 14px;border:1px solid #cfc9bd;border-radius:20px;font-size:15px;" />
       <button type="submit" class="primary" style="width:auto;max-width:none;margin-top:0;padding:10px 18px;border-radius:20px;" ${state.sendBusy ? 'disabled' : ''}>➤</button>
@@ -511,6 +534,15 @@ function renderConversation() {
   `;
 
   document.getElementById('backBtn').addEventListener('click', closeConversation);
+
+  const imageInput = document.getElementById('imageInput');
+  document.getElementById('attachBtn').addEventListener('click', () => imageInput.click());
+  imageInput.addEventListener('change', async () => {
+    const file = imageInput.files[0];
+    imageInput.value = '';
+    if (file) await sendImage(conv, file);
+  });
+
   const form = document.getElementById('sendForm');
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -533,6 +565,61 @@ function renderConversation() {
       set({ sendBusy: false, sendError: "Échec de l'envoi : " + (err.message || err), messageInput: text });
     }
   });
+}
+
+function renderBubbleContent(m) {
+  const bg = m.mine ? 'var(--green)' : '#fff';
+  const border = m.mine ? 'none' : '1px solid #e5e0d5';
+  if (m.type === 'image') {
+    const url = state.mediaUrls[m.id];
+    const inner = !url
+      ? `<div style="width:200px;height:140px;display:flex;align-items:center;justify-content:center;"><div class="spinner" style="margin:0;"></div></div>`
+      : url === 'error'
+        ? `<div style="padding:20px;color:${m.mine ? '#fff' : 'var(--ink)'};">🖼️ Image indéchiffrable</div>`
+        : `<img src="${url}" style="display:block;max-width:260px;max-height:320px;border-radius:14px;" />`;
+    return `<div style="border-radius:14px;overflow:hidden;background:${bg};border:${border};">${inner}</div>`;
+  }
+  return `
+    <div style="background:${bg};color:${m.mine ? '#fff' : 'var(--ink)'};padding:9px 13px;border-radius:14px;font-size:14px;border:${border};">
+      ${escapeHtml(m.text)}
+    </div>
+  `;
+}
+
+/** Compresse une image (max 1600px, JPEG q80 — même réglages qu'Android) via canvas. */
+async function compressImageFile(file, maxDim = 1600, quality = 0.8) {
+  const bitmap = await createImageBitmap(file);
+  const scale = Math.min(1, maxDim / Math.max(bitmap.width, bitmap.height));
+  const w = Math.max(1, Math.round(bitmap.width * scale));
+  const h = Math.max(1, Math.round(bitmap.height * scale));
+  const canvas = document.createElement('canvas');
+  canvas.width = w; canvas.height = h;
+  canvas.getContext('2d').drawImage(bitmap, 0, 0, w, h);
+  const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', quality));
+  return new Uint8Array(await blob.arrayBuffer());
+}
+
+async function sendImage(conv, file) {
+  set({ sendBusy: true, sendError: null });
+  try {
+    const jpeg = await compressImageFile(file);
+    const key = await getConvKey(conv);
+    const encrypted = await encryptRaw(key, jpeg);
+    const path = `${conv.id}/${crypto.randomUUID()}.enc`;
+    const { error: upErr } = await supabase.storage.from(MEDIA_BUCKET).upload(path, encrypted, { contentType: 'application/octet-stream' });
+    if (upErr) throw upErr;
+    const { error } = await supabase.from('messages').insert({
+      conversation_id: conv.id,
+      sender_id: state.user.id,
+      type: 'image',
+      media_path: path,
+      media_size: encrypted.byteLength,
+    });
+    if (error) throw error;
+    set({ sendBusy: false });
+  } catch (err) {
+    set({ sendBusy: false, sendError: "Échec de l'envoi de l'image : " + (err.message || err) });
+  }
 }
 
 // ---------- Démarrage ----------
