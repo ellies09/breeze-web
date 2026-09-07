@@ -818,17 +818,31 @@ function encodeWav(audioBuffer) {
   return new Uint8Array(buffer);
 }
 
-/** Décode un enregistrement (webm/opus, mp4/AAC…) et le ré-encode en WAV. */
+const VOICE_SAMPLE_RATE = 16000; // suffisant pour la voix (qualité téléphonique), réduit la taille ~6x vs 48kHz stéréo
+
+/**
+ * Décode un enregistrement (webm/opus, mp4/AAC…) et le ré-encode en WAV **mono 16 kHz** — la
+ * qualité stéréo/48kHz native est inutile pour de la voix et gonflerait le stockage Supabase
+ * (limité à 1 Go gratuit) ~6x plus que nécessaire.
+ */
 async function blobToWavBytes(blob) {
   const arrayBuf = await blob.arrayBuffer();
   const AudioCtx = window.AudioContext || window.webkitAudioContext;
-  const ctx = new AudioCtx();
+  const decodeCtx = new AudioCtx();
+  let decoded;
   try {
-    const audioBuffer = await ctx.decodeAudioData(arrayBuf);
-    return encodeWav(audioBuffer);
+    decoded = await decodeCtx.decodeAudioData(arrayBuf);
   } finally {
-    ctx.close();
+    decodeCtx.close();
   }
+  const frames = Math.max(1, Math.ceil(decoded.duration * VOICE_SAMPLE_RATE));
+  const offline = new OfflineAudioContext(1, frames, VOICE_SAMPLE_RATE);
+  const src = offline.createBufferSource();
+  src.buffer = decoded;
+  src.connect(offline.destination);
+  src.start();
+  const rendered = await offline.startRendering();
+  return encodeWav(rendered);
 }
 
 async function startRecording(conv) {
