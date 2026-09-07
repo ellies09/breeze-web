@@ -485,6 +485,7 @@ async function toDisplayMessage(m, key) {
  */
 function sniffAudioMimeType(bytes) {
   if (bytes[0] === 0x1a && bytes[1] === 0x45 && bytes[2] === 0xdf && bytes[3] === 0xa3) return 'audio/webm';
+  if (bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46) return 'audio/wav';
   return 'audio/mp4';
 }
 
@@ -780,6 +781,56 @@ function pickAudioMimeType() {
   return '';
 }
 
+/** Encode un AudioBuffer décodé en WAV PCM 16 bits (format universellement lisible). */
+function encodeWav(audioBuffer) {
+  const numChannels = audioBuffer.numberOfChannels;
+  const sampleRate = audioBuffer.sampleRate;
+  const numFrames = audioBuffer.length;
+  const blockAlign = numChannels * 2;
+  const dataSize = numFrames * blockAlign;
+  const buffer = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(buffer);
+  const writeStr = (offset, str) => { for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i)); };
+  writeStr(0, 'RIFF');
+  view.setUint32(4, 36 + dataSize, true);
+  writeStr(8, 'WAVE');
+  writeStr(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true); // PCM
+  view.setUint16(22, numChannels, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * blockAlign, true);
+  view.setUint16(32, blockAlign, true);
+  view.setUint16(34, 16, true);
+  writeStr(36, 'data');
+  view.setUint32(40, dataSize, true);
+  const channels = [];
+  for (let c = 0; c < numChannels; c++) channels.push(audioBuffer.getChannelData(c));
+  let offset = 44;
+  for (let i = 0; i < numFrames; i++) {
+    for (let c = 0; c < numChannels; c++) {
+      let sample = Math.max(-1, Math.min(1, channels[c][i]));
+      sample = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
+      view.setInt16(offset, sample, true);
+      offset += 2;
+    }
+  }
+  return new Uint8Array(buffer);
+}
+
+/** Décode un enregistrement (webm/opus, mp4/AAC…) et le ré-encode en WAV. */
+async function blobToWavBytes(blob) {
+  const arrayBuf = await blob.arrayBuffer();
+  const AudioCtx = window.AudioContext || window.webkitAudioContext;
+  const ctx = new AudioCtx();
+  try {
+    const audioBuffer = await ctx.decodeAudioData(arrayBuf);
+    return encodeWav(audioBuffer);
+  } finally {
+    ctx.close();
+  }
+}
+
 async function startRecording(conv) {
   if (state.recording) return;
   try {
@@ -798,9 +849,17 @@ async function startRecording(conv) {
     recordStream = null;
     clearInterval(recordTimer);
     const durationMs = Date.now() - recordStartedAt;
-    const blob = new Blob(recordedChunks, { type: mediaRecorder.mimeType || mimeType || 'audio/webm' });
+    const rawBlob = new Blob(recordedChunks, { type: mediaRecorder.mimeType || mimeType || 'audio/webm' });
     set({ recording: false, recordElapsedMs: 0 });
-    if (durationMs >= 500) await sendVoice(conv, blob, durationMs);
+    if (durationMs < 500) return;
+    try {
+      // Conversion systématique en WAV (PCM) : le format que produit Chrome (webm/opus) n'est
+      // pas fiable sur le lecteur audio natif Android — le WAV, non compressé, l'est toujours.
+      const wavBytes = await blobToWavBytes(rawBlob);
+      await sendVoice(conv, new Blob([wavBytes], { type: 'audio/wav' }), durationMs);
+    } catch (err) {
+      set({ sendError: "Conversion audio impossible : " + (err.message || err) });
+    }
   };
   mediaRecorder.start();
   set({ recording: true, recordElapsedMs: 0, sendError: null });
