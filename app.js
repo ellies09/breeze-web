@@ -43,8 +43,10 @@ let state = {
   messageInput: '',
   sendBusy: false,
   sendError: null,
-  mediaUrls: {},         // messageId -> object URL (image déchiffrée), une fois prête
+  mediaUrls: {},         // messageId -> object URL (image/vocal déchiffré), une fois prête
   fileDownloadBusy: null, // id du message fichier en cours de téléchargement, ou null
+  recording: false,
+  recordElapsedMs: 0,
 };
 
 function set(patch) {
@@ -462,6 +464,10 @@ async function toDisplayMessage(m, key) {
     try { if (m.ciphertext) fileName = await decryptMessage(key, m.ciphertext); } catch (_) {}
     return { id: m.id, mine, sentAt: m.sent_at, type: 'file', fileName, mediaPath: m.media_path };
   }
+  if (m.type === 'voice') {
+    loadImage(m.id, m.media_path, key, 'audio/mp4'); // même mécanisme de cache/chargement que les images
+    return { id: m.id, mine, sentAt: m.sent_at, type: 'voice' };
+  }
   if (m.type !== 'text') {
     return { id: m.id, mine, sentAt: m.sent_at, text: previewLabelFor(m) + ' (non affiché sur le web pour l’instant)' };
   }
@@ -473,15 +479,15 @@ async function toDisplayMessage(m, key) {
   }
 }
 
-/** Télécharge + déchiffre une image et publie son URL objet dans state.mediaUrls. */
-async function loadImage(messageId, mediaPath, key) {
+/** Télécharge + déchiffre un média (image/vocal) et publie son URL objet dans state.mediaUrls. */
+async function loadImage(messageId, mediaPath, key, mimeType = 'image/jpeg') {
   if (state.mediaUrls[messageId]) return;
   try {
     const { data, error } = await supabase.storage.from(MEDIA_BUCKET).download(mediaPath);
     if (error) throw error;
     const encBytes = new Uint8Array(await data.arrayBuffer());
     const plainBytes = await decryptRaw(key, encBytes);
-    const blob = new Blob([plainBytes], { type: 'image/jpeg' });
+    const blob = new Blob([plainBytes], { type: mimeType });
     const url = URL.createObjectURL(blob);
     set({ mediaUrls: { ...state.mediaUrls, [messageId]: url } });
   } catch (_) {
@@ -530,34 +536,51 @@ function renderConversation() {
       }
     </div>
     ${state.sendError ? `<div class="error" style="padding:0 16px;">${escapeHtml(state.sendError)}</div>` : ''}
+    ${state.recording ? `
+    <div style="display:flex;gap:8px;align-items:center;padding:10px 16px calc(10px + env(safe-area-inset-bottom));background:#fff;border-top:1px solid #e5e0d5;">
+      <div style="flex:1;display:flex;align-items:center;gap:8px;color:var(--error);font-size:14px;">
+        <span style="width:10px;height:10px;border-radius:50%;background:var(--error);"></span>
+        Enregistrement… ${recTimeLabel(state.recordElapsedMs)}
+      </div>
+      <button type="button" id="stopRecBtn" class="primary" style="width:auto;max-width:none;margin-top:0;padding:10px 18px;border-radius:20px;background:var(--error);">⏹ Envoyer</button>
+    </div>
+    ` : `
     <form id="sendForm" style="display:flex;gap:8px;align-items:center;padding:10px 16px calc(10px + env(safe-area-inset-bottom));background:#fff;border-top:1px solid #e5e0d5;">
       <input type="file" id="imageInput" accept="image/*" style="display:none;" />
       <input type="file" id="fileInput" style="display:none;" />
       <button type="button" id="attachBtn" style="background:none;border:none;font-size:22px;cursor:pointer;padding:4px;" ${state.sendBusy ? 'disabled' : ''}>📷</button>
       <button type="button" id="attachFileBtn" style="background:none;border:none;font-size:20px;cursor:pointer;padding:4px;" ${state.sendBusy ? 'disabled' : ''}>📎</button>
+      <button type="button" id="recordBtn" style="background:none;border:none;font-size:20px;cursor:pointer;padding:4px;" ${state.sendBusy ? 'disabled' : ''}>🎙️</button>
       <input type="text" id="messageInput" placeholder="Message chiffré…" autocomplete="off"
              value="${escapeHtml(state.messageInput)}" style="flex:1;padding:10px 14px;border:1px solid #cfc9bd;border-radius:20px;font-size:15px;" />
       <button type="submit" class="primary" style="width:auto;max-width:none;margin-top:0;padding:10px 18px;border-radius:20px;" ${state.sendBusy ? 'disabled' : ''}>➤</button>
     </form>
+    `}
   `;
 
   document.getElementById('backBtn').addEventListener('click', closeConversation);
 
-  const imageInput = document.getElementById('imageInput');
-  document.getElementById('attachBtn').addEventListener('click', () => imageInput.click());
-  imageInput.addEventListener('change', async () => {
-    const file = imageInput.files[0];
-    imageInput.value = '';
-    if (file) await sendImage(conv, file);
-  });
+  if (state.recording) {
+    document.getElementById('stopRecBtn').addEventListener('click', () => stopRecording());
+  } else {
+    const imageInput = document.getElementById('imageInput');
+    document.getElementById('attachBtn').addEventListener('click', () => imageInput.click());
+    imageInput.addEventListener('change', async () => {
+      const file = imageInput.files[0];
+      imageInput.value = '';
+      if (file) await sendImage(conv, file);
+    });
 
-  const fileInput = document.getElementById('fileInput');
-  document.getElementById('attachFileBtn').addEventListener('click', () => fileInput.click());
-  fileInput.addEventListener('change', async () => {
-    const file = fileInput.files[0];
-    fileInput.value = '';
-    if (file) await sendFile(conv, file);
-  });
+    const fileInput = document.getElementById('fileInput');
+    document.getElementById('attachFileBtn').addEventListener('click', () => fileInput.click());
+    fileInput.addEventListener('change', async () => {
+      const file = fileInput.files[0];
+      fileInput.value = '';
+      if (file) await sendFile(conv, file);
+    });
+
+    document.getElementById('recordBtn').addEventListener('click', () => startRecording(conv));
+  }
 
   document.querySelectorAll('[data-file-msg]').forEach((el) => {
     el.addEventListener('click', () => downloadFile(conv, el.dataset.fileMsg));
@@ -606,6 +629,19 @@ function renderBubbleContent(m) {
            style="display:flex;align-items:center;gap:10px;cursor:pointer;background:${bg};color:${m.mine ? '#fff' : 'var(--ink)'};padding:10px 14px;border-radius:14px;font-size:14px;border:${border};max-width:260px;">
         <span style="font-size:20px;">${busy ? '⏳' : '📎'}</span>
         <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(m.fileName)}</span>
+      </div>
+    `;
+  }
+  if (m.type === 'voice') {
+    const url = state.mediaUrls[m.id];
+    const inner = !url
+      ? `<div class="spinner" style="margin:4px;width:20px;height:20px;border-width:2px;"></div>`
+      : url === 'error'
+        ? `<span>🎙️ Vocal indéchiffrable</span>`
+        : `<audio controls preload="none" src="${url}" style="height:36px;max-width:230px;"></audio>`;
+    return `
+      <div style="display:flex;align-items:center;background:${bg};color:${m.mine ? '#fff' : 'var(--ink)'};padding:8px 12px;border-radius:14px;font-size:14px;border:${border};">
+        ${inner}
       </div>
     `;
   }
@@ -706,6 +742,83 @@ async function downloadFile(conv, messageId) {
     set({ fileDownloadBusy: null });
   } catch (err) {
     set({ fileDownloadBusy: null, sendError: "Échec du téléchargement : " + (err.message || err) });
+  }
+}
+
+// ---------- Mémos vocaux ----------
+
+let mediaRecorder = null;
+let recordedChunks = [];
+let recordTimer = null;
+let recordStream = null;
+let recordStartedAt = 0;
+
+function recTimeLabel(ms) {
+  const s = Math.floor(ms / 1000);
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+}
+
+/** Préfère audio/mp4 (AAC) — lisible nativement par l'app Android, et supporté par Safari iOS. */
+function pickAudioMimeType() {
+  const candidates = ['audio/mp4', 'audio/mp4;codecs=mp4a.40.2', 'audio/webm;codecs=opus', 'audio/webm'];
+  for (const c of candidates) {
+    if (window.MediaRecorder && MediaRecorder.isTypeSupported(c)) return c;
+  }
+  return '';
+}
+
+async function startRecording(conv) {
+  if (state.recording) return;
+  try {
+    recordStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (err) {
+    set({ sendError: 'Microphone indisponible : ' + (err.message || err) });
+    return;
+  }
+  const mimeType = pickAudioMimeType();
+  recordedChunks = [];
+  mediaRecorder = new MediaRecorder(recordStream, mimeType ? { mimeType } : undefined);
+  recordStartedAt = Date.now();
+  mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) recordedChunks.push(e.data); };
+  mediaRecorder.onstop = async () => {
+    recordStream.getTracks().forEach((t) => t.stop());
+    recordStream = null;
+    clearInterval(recordTimer);
+    const durationMs = Date.now() - recordStartedAt;
+    const blob = new Blob(recordedChunks, { type: mediaRecorder.mimeType || mimeType || 'audio/webm' });
+    set({ recording: false, recordElapsedMs: 0 });
+    if (durationMs >= 500) await sendVoice(conv, blob, durationMs);
+  };
+  mediaRecorder.start();
+  set({ recording: true, recordElapsedMs: 0, sendError: null });
+  recordTimer = setInterval(() => set({ recordElapsedMs: Date.now() - recordStartedAt }), 250);
+}
+
+function stopRecording() {
+  if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
+}
+
+async function sendVoice(conv, blob, durationMs) {
+  set({ sendBusy: true, sendError: null });
+  try {
+    const bytes = new Uint8Array(await blob.arrayBuffer());
+    const key = await getConvKey(conv);
+    const encrypted = await encryptRaw(key, bytes);
+    const path = `${conv.id}/${crypto.randomUUID()}.enc`;
+    const { error: upErr } = await supabase.storage.from(MEDIA_BUCKET).upload(path, encrypted, { contentType: 'application/octet-stream' });
+    if (upErr) throw upErr;
+    const { error } = await supabase.from('messages').insert({
+      conversation_id: conv.id,
+      sender_id: state.user.id,
+      type: 'voice',
+      media_path: path,
+      media_size: encrypted.byteLength,
+      duration_ms: Math.round(durationMs),
+    });
+    if (error) throw error;
+    set({ sendBusy: false });
+  } catch (err) {
+    set({ sendBusy: false, sendError: "Échec de l'envoi du vocal : " + (err.message || err) });
   }
 }
 
