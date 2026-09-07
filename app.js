@@ -44,6 +44,7 @@ let state = {
   sendBusy: false,
   sendError: null,
   mediaUrls: {},         // messageId -> object URL (image déchiffrée), une fois prête
+  fileDownloadBusy: null, // id du message fichier en cours de téléchargement, ou null
 };
 
 function set(patch) {
@@ -456,6 +457,11 @@ async function toDisplayMessage(m, key) {
     loadImage(m.id, m.media_path, key);
     return { id: m.id, mine, sentAt: m.sent_at, type: 'image' };
   }
+  if (m.type === 'file') {
+    let fileName = 'Fichier';
+    try { if (m.ciphertext) fileName = await decryptMessage(key, m.ciphertext); } catch (_) {}
+    return { id: m.id, mine, sentAt: m.sent_at, type: 'file', fileName, mediaPath: m.media_path };
+  }
   if (m.type !== 'text') {
     return { id: m.id, mine, sentAt: m.sent_at, text: previewLabelFor(m) + ' (non affiché sur le web pour l’instant)' };
   }
@@ -526,7 +532,9 @@ function renderConversation() {
     ${state.sendError ? `<div class="error" style="padding:0 16px;">${escapeHtml(state.sendError)}</div>` : ''}
     <form id="sendForm" style="display:flex;gap:8px;align-items:center;padding:10px 16px calc(10px + env(safe-area-inset-bottom));background:#fff;border-top:1px solid #e5e0d5;">
       <input type="file" id="imageInput" accept="image/*" style="display:none;" />
+      <input type="file" id="fileInput" style="display:none;" />
       <button type="button" id="attachBtn" style="background:none;border:none;font-size:22px;cursor:pointer;padding:4px;" ${state.sendBusy ? 'disabled' : ''}>📷</button>
+      <button type="button" id="attachFileBtn" style="background:none;border:none;font-size:20px;cursor:pointer;padding:4px;" ${state.sendBusy ? 'disabled' : ''}>📎</button>
       <input type="text" id="messageInput" placeholder="Message chiffré…" autocomplete="off"
              value="${escapeHtml(state.messageInput)}" style="flex:1;padding:10px 14px;border:1px solid #cfc9bd;border-radius:20px;font-size:15px;" />
       <button type="submit" class="primary" style="width:auto;max-width:none;margin-top:0;padding:10px 18px;border-radius:20px;" ${state.sendBusy ? 'disabled' : ''}>➤</button>
@@ -541,6 +549,18 @@ function renderConversation() {
     const file = imageInput.files[0];
     imageInput.value = '';
     if (file) await sendImage(conv, file);
+  });
+
+  const fileInput = document.getElementById('fileInput');
+  document.getElementById('attachFileBtn').addEventListener('click', () => fileInput.click());
+  fileInput.addEventListener('change', async () => {
+    const file = fileInput.files[0];
+    fileInput.value = '';
+    if (file) await sendFile(conv, file);
+  });
+
+  document.querySelectorAll('[data-file-msg]').forEach((el) => {
+    el.addEventListener('click', () => downloadFile(conv, el.dataset.fileMsg));
   });
 
   const form = document.getElementById('sendForm');
@@ -578,6 +598,16 @@ function renderBubbleContent(m) {
         ? `<div style="padding:20px;color:${m.mine ? '#fff' : 'var(--ink)'};">🖼️ Image indéchiffrable</div>`
         : `<img src="${url}" style="display:block;max-width:260px;max-height:320px;border-radius:14px;" />`;
     return `<div style="border-radius:14px;overflow:hidden;background:${bg};border:${border};">${inner}</div>`;
+  }
+  if (m.type === 'file') {
+    const busy = state.fileDownloadBusy === m.id;
+    return `
+      <div class="file-bubble" data-file-msg="${m.id}"
+           style="display:flex;align-items:center;gap:10px;cursor:pointer;background:${bg};color:${m.mine ? '#fff' : 'var(--ink)'};padding:10px 14px;border-radius:14px;font-size:14px;border:${border};max-width:260px;">
+        <span style="font-size:20px;">${busy ? '⏳' : '📎'}</span>
+        <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(m.fileName)}</span>
+      </div>
+    `;
   }
   return `
     <div style="background:${bg};color:${m.mine ? '#fff' : 'var(--ink)'};padding:9px 13px;border-radius:14px;font-size:14px;border:${border};">
@@ -619,6 +649,63 @@ async function sendImage(conv, file) {
     set({ sendBusy: false });
   } catch (err) {
     set({ sendBusy: false, sendError: "Échec de l'envoi de l'image : " + (err.message || err) });
+  }
+}
+
+const MAX_UPLOAD_BYTES = 50_000_000; // même plafond que l'app Android (Storage gratuit 50 Mo/fichier)
+
+async function sendFile(conv, file) {
+  if (file.size > MAX_UPLOAD_BYTES) {
+    set({ sendError: `Fichier trop volumineux : ${Math.round(file.size / 1_000_000)} Mo (maximum 50 Mo).` });
+    return;
+  }
+  set({ sendBusy: true, sendError: null });
+  try {
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    const key = await getConvKey(conv);
+    const encrypted = await encryptRaw(key, bytes);
+    const path = `${conv.id}/${crypto.randomUUID()}.enc`;
+    const { error: upErr } = await supabase.storage.from(MEDIA_BUCKET).upload(path, encrypted, { contentType: 'application/octet-stream' });
+    if (upErr) throw upErr;
+    const ciphertext = await encryptMessage(key, file.name);
+    const { error } = await supabase.from('messages').insert({
+      conversation_id: conv.id,
+      sender_id: state.user.id,
+      type: 'file',
+      media_path: path,
+      media_size: encrypted.byteLength,
+      ciphertext,
+    });
+    if (error) throw error;
+    set({ sendBusy: false });
+  } catch (err) {
+    set({ sendBusy: false, sendError: "Échec de l'envoi du fichier : " + (err.message || err) });
+  }
+}
+
+/** Télécharge + déchiffre un fichier et déclenche l'enregistrement dans le navigateur. */
+async function downloadFile(conv, messageId) {
+  const m = (state.messages || []).find((x) => x.id === messageId);
+  if (!m || m.type !== 'file' || state.fileDownloadBusy) return;
+  set({ fileDownloadBusy: messageId, sendError: null });
+  try {
+    const key = await getConvKey(conv);
+    const { data, error } = await supabase.storage.from(MEDIA_BUCKET).download(m.mediaPath);
+    if (error) throw error;
+    const encBytes = new Uint8Array(await data.arrayBuffer());
+    const plainBytes = await decryptRaw(key, encBytes);
+    const blob = new Blob([plainBytes]);
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = m.fileName || 'fichier';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 30000);
+    set({ fileDownloadBusy: null });
+  } catch (err) {
+    set({ fileDownloadBusy: null, sendError: "Échec du téléchargement : " + (err.message || err) });
   }
 }
 
