@@ -818,7 +818,7 @@ function encodeWav(audioBuffer) {
   return new Uint8Array(buffer);
 }
 
-const VOICE_SAMPLE_RATE = 16000; // suffisant pour la voix (qualité téléphonique), réduit la taille ~6x vs 48kHz stéréo
+const VOICE_SAMPLE_RATE = 8000; // qualité téléphonique (norme des appels voix) — réduit la taille ~12x vs 48kHz stéréo
 
 /**
  * Décode un enregistrement (webm/opus, mp4/AAC…) et le ré-encode en WAV **mono 16 kHz** — la
