@@ -43,10 +43,11 @@ let state = {
   messageInput: '',
   sendBusy: false,
   sendError: null,
-  mediaUrls: {},         // messageId -> object URL (image/vocal déchiffré), une fois prête
+  mediaUrls: {},         // messageId -> object URL (image/vocal/vidéo déchiffré), une fois prête
   fileDownloadBusy: null, // id du message fichier en cours de téléchargement, ou null
   recording: false,
   recordElapsedMs: 0,
+  videoProcessing: false,
 };
 
 function set(patch) {
@@ -468,6 +469,10 @@ async function toDisplayMessage(m, key) {
     loadImage(m.id, m.media_path, key, sniffAudioMimeType);
     return { id: m.id, mine, sentAt: m.sent_at, type: 'voice' };
   }
+  if (m.type === 'video') {
+    loadImage(m.id, m.media_path, key, 'video/mp4');
+    return { id: m.id, mine, sentAt: m.sent_at, type: 'video' };
+  }
   if (m.type !== 'text') {
     return { id: m.id, mine, sentAt: m.sent_at, text: previewLabelFor(m) + ' (non affiché sur le web pour l’instant)' };
   }
@@ -550,7 +555,12 @@ function renderConversation() {
       }
     </div>
     ${state.sendError ? `<div class="error" style="padding:0 16px;">${escapeHtml(state.sendError)}</div>` : ''}
-    ${state.recording ? `
+    ${state.videoProcessing ? `
+    <div style="display:flex;gap:8px;align-items:center;padding:10px 16px calc(10px + env(safe-area-inset-bottom));background:#fff;border-top:1px solid #e5e0d5;color:var(--sage);font-size:14px;">
+      <div class="spinner" style="margin:0;width:18px;height:18px;border-width:2px;"></div>
+      Compression de la vidéo…
+    </div>
+    ` : state.recording ? `
     <div style="display:flex;gap:8px;align-items:center;padding:10px 16px calc(10px + env(safe-area-inset-bottom));background:#fff;border-top:1px solid #e5e0d5;">
       <div style="flex:1;display:flex;align-items:center;gap:8px;color:var(--error);font-size:14px;">
         <span style="width:10px;height:10px;border-radius:50%;background:var(--error);"></span>
@@ -561,8 +571,10 @@ function renderConversation() {
     ` : `
     <form id="sendForm" style="display:flex;gap:8px;align-items:center;padding:10px 16px calc(10px + env(safe-area-inset-bottom));background:#fff;border-top:1px solid #e5e0d5;">
       <input type="file" id="imageInput" accept="image/*" style="display:none;" />
+      <input type="file" id="videoInput" accept="video/*" style="display:none;" />
       <input type="file" id="fileInput" style="display:none;" />
       <button type="button" id="attachBtn" style="background:none;border:none;font-size:22px;cursor:pointer;padding:4px;" ${state.sendBusy ? 'disabled' : ''}>📷</button>
+      <button type="button" id="attachVideoBtn" style="background:none;border:none;font-size:20px;cursor:pointer;padding:4px;" ${state.sendBusy ? 'disabled' : ''}>🎥</button>
       <button type="button" id="attachFileBtn" style="background:none;border:none;font-size:20px;cursor:pointer;padding:4px;" ${state.sendBusy ? 'disabled' : ''}>📎</button>
       <button type="button" id="recordBtn" style="background:none;border:none;font-size:20px;cursor:pointer;padding:4px;" ${state.sendBusy ? 'disabled' : ''}>🎙️</button>
       <input type="text" id="messageInput" placeholder="Message chiffré…" autocomplete="off"
@@ -574,7 +586,9 @@ function renderConversation() {
 
   document.getElementById('backBtn').addEventListener('click', closeConversation);
 
-  if (state.recording) {
+  if (state.videoProcessing) {
+    // Rien à câbler : seul l'indicateur de compression est affiché.
+  } else if (state.recording) {
     document.getElementById('stopRecBtn').addEventListener('click', () => stopRecording());
   } else {
     const imageInput = document.getElementById('imageInput');
@@ -583,6 +597,14 @@ function renderConversation() {
       const file = imageInput.files[0];
       imageInput.value = '';
       if (file) await sendImage(conv, file);
+    });
+
+    const videoInput = document.getElementById('videoInput');
+    document.getElementById('attachVideoBtn').addEventListener('click', () => videoInput.click());
+    videoInput.addEventListener('change', async () => {
+      const file = videoInput.files[0];
+      videoInput.value = '';
+      if (file) await sendVideo(conv, file);
     });
 
     const fileInput = document.getElementById('fileInput');
@@ -594,33 +616,33 @@ function renderConversation() {
     });
 
     document.getElementById('recordBtn').addEventListener('click', () => startRecording(conv));
+
+    const form = document.getElementById('sendForm');
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const input = document.getElementById('messageInput');
+      const text = input.value.trim();
+      if (!text) return;
+      set({ sendBusy: true, sendError: null, messageInput: '' });
+      try {
+        const key = await getConvKey(conv);
+        const ciphertext = await encryptMessage(key, text);
+        const { error } = await supabase.from('messages').insert({
+          conversation_id: conv.id,
+          sender_id: state.user.id,
+          ciphertext,
+          type: 'text',
+        });
+        if (error) throw error;
+        set({ sendBusy: false });
+      } catch (err) {
+        set({ sendBusy: false, sendError: "Échec de l'envoi : " + (err.message || err), messageInput: text });
+      }
+    });
   }
 
   document.querySelectorAll('[data-file-msg]').forEach((el) => {
     el.addEventListener('click', () => downloadFile(conv, el.dataset.fileMsg));
-  });
-
-  const form = document.getElementById('sendForm');
-  form.addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const input = document.getElementById('messageInput');
-    const text = input.value.trim();
-    if (!text) return;
-    set({ sendBusy: true, sendError: null, messageInput: '' });
-    try {
-      const key = await getConvKey(conv);
-      const ciphertext = await encryptMessage(key, text);
-      const { error } = await supabase.from('messages').insert({
-        conversation_id: conv.id,
-        sender_id: state.user.id,
-        ciphertext,
-        type: 'text',
-      });
-      if (error) throw error;
-      set({ sendBusy: false });
-    } catch (err) {
-      set({ sendBusy: false, sendError: "Échec de l'envoi : " + (err.message || err), messageInput: text });
-    }
   });
 }
 
@@ -634,6 +656,15 @@ function renderBubbleContent(m) {
       : url === 'error'
         ? `<div style="padding:20px;color:${m.mine ? '#fff' : 'var(--ink)'};">🖼️ Image indéchiffrable</div>`
         : `<img src="${url}" style="display:block;max-width:260px;max-height:320px;border-radius:14px;" />`;
+    return `<div style="border-radius:14px;overflow:hidden;background:${bg};border:${border};">${inner}</div>`;
+  }
+  if (m.type === 'video') {
+    const url = state.mediaUrls[m.id];
+    const inner = !url
+      ? `<div style="width:200px;height:140px;display:flex;align-items:center;justify-content:center;"><div class="spinner" style="margin:0;"></div></div>`
+      : url === 'error'
+        ? `<div style="padding:20px;color:${m.mine ? '#fff' : 'var(--ink)'};">🎥 Vidéo indéchiffrable</div>`
+        : `<video controls preload="none" src="${url}" style="display:block;max-width:260px;max-height:320px;border-radius:14px;"></video>`;
     return `<div style="border-radius:14px;overflow:hidden;background:${bg};border:${border};">${inner}</div>`;
   }
   if (m.type === 'file') {
@@ -666,7 +697,9 @@ function renderBubbleContent(m) {
   `;
 }
 
-/** Compresse une image (max 1600px, JPEG q80 — même réglages qu'Android) via canvas. */
+/** Compresse une image (max 1600px comme Android, JPEG q65 — qualité réduite pour économiser le
+ * quota Storage ; la résolution reste identique à Android donc aucune divergence de rendu, seule
+ * la qualité JPEG change, ce qui n'affecte pas la compatibilité de lecture côté Android). */
 async function compressImageFile(file, maxDim = 1600, quality = 0.65) {
   const bitmap = await createImageBitmap(file);
   const scale = Math.min(1, maxDim / Math.max(bitmap.width, bitmap.height));
@@ -756,6 +789,130 @@ async function downloadFile(conv, messageId) {
     set({ fileDownloadBusy: null });
   } catch (err) {
     set({ fileDownloadBusy: null, sendError: "Échec du téléchargement : " + (err.message || err) });
+  }
+}
+
+// ---------- Vidéos ----------
+
+const MAX_VIDEO_DURATION_S = 60; // limite courte pour maîtriser le quota Storage gratuit (1 Go)
+const VIDEO_MAX_DIM = 640; // comme pour la voix, résolution réduite = fichiers bien plus petits
+const VIDEO_BITRATE = 800_000; // ~800 kbit/s, qualité correcte pour un message vidéo court
+
+function getVideoDuration(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const v = document.createElement('video');
+    v.preload = 'metadata';
+    v.onloadedmetadata = () => { URL.revokeObjectURL(url); resolve(v.duration); };
+    v.onerror = () => { URL.revokeObjectURL(url); reject(new Error('Vidéo illisible')); };
+    v.src = url;
+  });
+}
+
+/** Préfère video/mp4 (H.264/AAC) — natif sur Safari iOS, lisible directement par Android. */
+function pickVideoMimeType() {
+  const candidates = ['video/mp4', 'video/mp4;codecs=avc1', 'video/webm;codecs=vp9', 'video/webm'];
+  for (const c of candidates) {
+    if (window.MediaRecorder && MediaRecorder.isTypeSupported(c)) return c;
+  }
+  return '';
+}
+
+/**
+ * Ré-encode une vidéo en la rejouant dans un <video> caché, en dessinant chaque frame réduite sur
+ * un canvas, et en ré-enregistrant le résultat (image + son) via MediaRecorder. Pas de dépendance
+ * externe : une bibliothèque de transcodage (ffmpeg.wasm) a été testée mais s'est montrée trop
+ * lourde (~30 Mo) et peu fiable (chargement qui reste bloqué sans erreur) — cette approche ne
+ * réutilise que des API navigateur déjà en place pour les mémos vocaux.
+ */
+async function recompressVideoFile(file) {
+  const url = URL.createObjectURL(file);
+  const video = document.createElement('video');
+  video.src = url;
+  video.muted = false;
+  video.playsInline = true;
+  await new Promise((resolve, reject) => {
+    video.onloadedmetadata = resolve;
+    video.onerror = () => reject(new Error('Vidéo illisible'));
+  });
+
+  const scale = Math.min(1, VIDEO_MAX_DIM / Math.max(video.videoWidth, video.videoHeight));
+  const w = Math.max(2, Math.round(video.videoWidth * scale / 2) * 2);
+  const h = Math.max(2, Math.round(video.videoHeight * scale / 2) * 2);
+
+  const canvas = document.createElement('canvas');
+  canvas.width = w; canvas.height = h;
+  const ctx = canvas.getContext('2d');
+  const canvasStream = canvas.captureStream(30);
+
+  let combinedStream = canvasStream;
+  try {
+    const srcStream = video.captureStream ? video.captureStream() : video.mozCaptureStream();
+    const audioTracks = srcStream.getAudioTracks();
+    if (audioTracks.length > 0) combinedStream = new MediaStream([...canvasStream.getVideoTracks(), ...audioTracks]);
+  } catch (_) {}
+
+  const mimeType = pickVideoMimeType();
+  const rec = new MediaRecorder(combinedStream, mimeType ? { mimeType, videoBitsPerSecond: VIDEO_BITRATE } : { videoBitsPerSecond: VIDEO_BITRATE });
+  const chunks = [];
+  rec.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+  const stopped = new Promise((resolve) => { rec.onstop = resolve; });
+
+  let drawing = true;
+  function drawLoop() {
+    if (!drawing) return;
+    ctx.drawImage(video, 0, 0, w, h);
+    requestAnimationFrame(drawLoop);
+  }
+
+  const ended = new Promise((resolve) => { video.onended = resolve; });
+  rec.start();
+  video.currentTime = 0;
+  await video.play();
+  drawLoop();
+  await ended;
+  drawing = false;
+  rec.stop();
+  await stopped;
+  URL.revokeObjectURL(url);
+
+  return new Blob(chunks, { type: rec.mimeType || mimeType || 'video/webm' });
+}
+
+async function sendVideo(conv, file) {
+  set({ sendError: null });
+  let durationS;
+  try {
+    durationS = await getVideoDuration(file);
+  } catch (err) {
+    set({ sendError: 'Vidéo illisible : ' + (err.message || err) });
+    return;
+  }
+  if (durationS > MAX_VIDEO_DURATION_S) {
+    set({ sendError: `Vidéo trop longue : ${Math.round(durationS)}s (maximum ${MAX_VIDEO_DURATION_S}s).` });
+    return;
+  }
+  set({ sendBusy: true, sendError: null, videoProcessing: true });
+  try {
+    const compressed = await recompressVideoFile(file);
+    const bytes = new Uint8Array(await compressed.arrayBuffer());
+    const key = await getConvKey(conv);
+    const encrypted = await encryptRaw(key, bytes);
+    const path = `${conv.id}/${crypto.randomUUID()}.enc`;
+    const { error: upErr } = await supabase.storage.from(MEDIA_BUCKET).upload(path, encrypted, { contentType: 'application/octet-stream' });
+    if (upErr) throw upErr;
+    const { error } = await supabase.from('messages').insert({
+      conversation_id: conv.id,
+      sender_id: state.user.id,
+      type: 'video',
+      media_path: path,
+      media_size: encrypted.byteLength,
+      duration_ms: Math.round(durationS * 1000),
+    });
+    if (error) throw error;
+    set({ sendBusy: false, videoProcessing: false });
+  } catch (err) {
+    set({ sendBusy: false, videoProcessing: false, sendError: "Échec de l'envoi de la vidéo : " + (err.message || err) });
   }
 }
 
