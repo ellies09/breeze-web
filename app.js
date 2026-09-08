@@ -667,7 +667,7 @@ function renderBubbleContent(m) {
 }
 
 /** Compresse une image (max 1600px, JPEG q80 — même réglages qu'Android) via canvas. */
-async function compressImageFile(file, maxDim = 1600, quality = 0.8) {
+async function compressImageFile(file, maxDim = 1600, quality = 0.65) {
   const bitmap = await createImageBitmap(file);
   const scale = Math.min(1, maxDim / Math.max(bitmap.width, bitmap.height));
   const w = Math.max(1, Math.round(bitmap.width * scale));
