@@ -107,10 +107,33 @@
   .banner {
     background: #fdf0e4; color: #7D4F35; font-size: 12px; padding: 10px 16px; text-align: center;
   }
+
+  /* Appels */
+  #callOverlay {
+    display: none; position: fixed; inset: 0; z-index: 1000;
+    background: var(--forest); color: #fff;
+    align-items: center; justify-content: center;
+  }
+  .call-screen { display: flex; flex-direction: column; align-items: center; justify-content: center; width: 100%; height: 100%; position: relative; }
+  .call-avatar {
+    width: 96px; height: 96px; border-radius: 50%; background: var(--sand); color: #fff;
+    display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 36px;
+    margin-bottom: 14px;
+  }
+  .call-name { font-size: 20px; font-weight: 700; text-shadow: 0 1px 3px rgba(0,0,0,.5); }
+  .call-status { font-size: 14px; opacity: .85; margin-top: 4px; margin-bottom: 28px; text-shadow: 0 1px 3px rgba(0,0,0,.5); }
+  .call-actions { display: flex; gap: 20px; align-items: center; }
+  .call-btn {
+    width: 56px; height: 56px; border-radius: 50%; border: none; font-size: 24px; cursor: pointer;
+    background: rgba(255,255,255,0.18); color: #fff;
+  }
+  .call-btn-end { background: var(--error); }
+  .call-btn-accept { background: var(--green); }
 </style>
 </head>
 <body>
 <div id="app"></div>
-<script type="module" src="app.js?v=11"></script>
+<div id="callOverlay"></div>
+<script type="module" src="app.js?v=12"></script>
 </body>
 </html>
