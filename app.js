@@ -255,11 +255,12 @@ async function loadConversations() {
       if (!conv || conv.archived) continue;
       const isGroup = conv.type === 'group';
       let label = conv.name || 'Groupe';
+      let otherUid = null;
       if (!isGroup) {
         const { data: others } = await supabase.from('conversation_members').select('user_id').eq('conversation_id', row.conversation_id);
-        const otherId = (others || []).map((o) => o.user_id).find((id) => id !== me);
-        const other = (state.members || []).find((m) => m.id === otherId);
-        label = other?.display_name?.trim() || other?.email || otherId?.slice(0, 8) || 'Membre';
+        otherUid = (others || []).map((o) => o.user_id).find((id) => id !== me) || null;
+        const other = (state.members || []).find((m) => m.id === otherUid);
+        label = other?.display_name?.trim() || other?.email || otherUid?.slice(0, 8) || 'Membre';
       }
       const { data: lastRows } = await supabase
         .from('messages')
@@ -268,7 +269,7 @@ async function loadConversations() {
         .order('sent_at', { ascending: false })
         .limit(1);
       const last = (lastRows || [])[0] || null;
-      list.push({ id: row.conversation_id, encryptedKey: row.encrypted_key, isGroup, label, lastMessage: last, lastAt: last?.sent_at || null });
+      list.push({ id: row.conversation_id, encryptedKey: row.encrypted_key, isGroup, otherUid, label, lastMessage: last, lastAt: last?.sent_at || null });
     }
     list.sort((a, b) => (b.lastAt || '').localeCompare(a.lastAt || ''));
     set({ conversations: list });
@@ -541,7 +542,11 @@ function renderConversation() {
   app.innerHTML = `
     <div class="topbar">
       <button id="backBtn" style="background:none;border:none;color:#fff;font-size:20px;cursor:pointer;padding:0 6px 0 0;">‹</button>
-      ${escapeHtml(conv.label)}${conv.isGroup ? ' 👥' : ''}
+      <span style="flex:1;">${escapeHtml(conv.label)}${conv.isGroup ? ' 👥' : ''}</span>
+      ${!conv.isGroup && conv.otherUid ? `
+        <button id="callAudioBtn" style="background:none;border:none;color:#fff;font-size:18px;cursor:pointer;padding:4px 8px;">📞</button>
+        <button id="callVideoBtn" style="background:none;border:none;color:#fff;font-size:18px;cursor:pointer;padding:4px 8px;">🎥</button>
+      ` : ''}
     </div>
     <div style="flex:1;overflow-y:auto;padding:14px 16px;display:flex;flex-direction:column;gap:8px;">
       ${msgs === null ? `<div class="spinner"></div>` :
@@ -585,6 +590,10 @@ function renderConversation() {
   `;
 
   document.getElementById('backBtn').addEventListener('click', closeConversation);
+  const callAudioBtn = document.getElementById('callAudioBtn');
+  if (callAudioBtn) callAudioBtn.addEventListener('click', () => startCall(conv.otherUid, conv.label, 'audio'));
+  const callVideoBtn = document.getElementById('callVideoBtn');
+  if (callVideoBtn) callVideoBtn.addEventListener('click', () => startCall(conv.otherUid, conv.label, 'video'));
 
   if (state.videoProcessing) {
     // Rien à câbler : seul l'indicateur de compression est affiché.
@@ -1065,14 +1074,392 @@ async function sendVoice(conv, blob, durationMs) {
   }
 }
 
+// ---------- Appels (WebRTC) ----------
+//
+// Signalisation identique à l'app Android (Calls.kt/WebRtcEngine.kt) : broadcast Supabase Realtime
+// éphémère sur le canal "call-inbox-<uid>" de chaque utilisateur, événement "signal". Types de
+// signal : invite | accept | reject | busy | cancel | end | offer | answer | ice. Seuls les appels
+// 1:1 sont repris côté web (les appels de groupe restent expérimentaux même côté Android).
+
+function myDisplayName() {
+  return state.profile?.display_name?.trim() || state.user?.email || 'Quelqu\'un';
+}
+
+let call = { status: 'idle' }; // idle | outgoing | incoming | active | ended
+let lastCallRenderStatus = null;
+let callTickTimer = null;
+const callChannels = {}; // uid -> { channel, ready: Promise<channel> }
+let cachedTurnServers = [];
+
+function callChannelFor(uid) {
+  if (callChannels[uid]) return callChannels[uid].ready;
+  const ch = supabase.channel('call-inbox-' + uid);
+  ch.on('broadcast', { event: 'signal' }, ({ payload }) => onCallSignal(payload));
+  const ready = new Promise((resolve) => {
+    ch.subscribe((status) => { if (status === 'SUBSCRIBED') resolve(ch); });
+  });
+  callChannels[uid] = { channel: ch, ready };
+  return ready;
+}
+
+async function sendCallSignal(signal) {
+  try {
+    const ch = await callChannelFor(signal.toUid);
+    await ch.send({ type: 'broadcast', event: 'signal', payload: signal });
+  } catch (_) {}
+}
+
+function makeSignal(type, toUid, kind, extra = {}) {
+  return {
+    type, fromUid: state.user.id, fromName: myDisplayName(), toUid, kind,
+    payload: extra.payload || '', callId: extra.callId || '',
+    groupId: extra.groupId ?? null, groupName: extra.groupName ?? null,
+    participants: extra.participants || '',
+  };
+}
+
+/** Démarre l'écoute de la boîte d'appels de l'utilisateur connecté (appelé une fois au login). */
+async function startCallListening(uid) {
+  try {
+    const { data, error } = await supabase.functions.invoke('turn-credentials');
+    if (!error && data?.iceServers) cachedTurnServers = data.iceServers;
+  } catch (_) {}
+  await callChannelFor(uid);
+}
+
+const CALL_RING_TIMEOUT_MS = 45_000;
+
+function onCallSignal(sig) {
+  if (!state.user || sig.toUid !== state.user.id) return;
+  if (sig.type === 'invite') {
+    if (sig.groupId) return; // appels de groupe non pris en charge côté web
+    if (call.status === 'idle') {
+      call = { status: 'incoming', peerUid: sig.fromUid, peerName: sig.fromName, kind: sig.kind };
+      call.timeoutId = setTimeout(() => {
+        if (call.status === 'incoming') { call = { status: 'idle' }; renderCallOverlay(); }
+      }, CALL_RING_TIMEOUT_MS);
+      renderCallOverlay();
+    } else if (call.status === 'incoming' && call.peerUid === sig.fromUid) {
+      // déjà affiché, ignorer
+    } else {
+      sendCallSignal(makeSignal('busy', sig.fromUid, sig.kind));
+    }
+    return;
+  }
+  if (sig.type === 'accept') {
+    if (call.status === 'outgoing' && call.peerUid === sig.fromUid) {
+      clearTimeout(call.timeoutId);
+      call = { status: 'active', peerUid: call.peerUid, peerName: call.peerName, kind: call.kind, startedAt: Date.now(), micOn: true, camOn: call.kind === 'video', connected: false };
+      renderCallOverlay();
+      startWebRtc(true, call.kind, call.peerUid);
+    }
+    return;
+  }
+  if (sig.type === 'reject') {
+    if (call.status === 'outgoing') { clearTimeout(call.timeoutId); endCall('Appel refusé'); }
+    return;
+  }
+  if (sig.type === 'busy') {
+    if (call.status === 'outgoing') { clearTimeout(call.timeoutId); endCall('Occupé'); }
+    return;
+  }
+  if (sig.type === 'cancel') {
+    if (call.status === 'incoming') {
+      clearTimeout(call.timeoutId);
+      call = { status: 'idle' };
+      renderCallOverlay();
+    }
+    return;
+  }
+  if (sig.type === 'end') {
+    if (call.status === 'active') endCall('Appel terminé');
+    return;
+  }
+  if (sig.type === 'offer' || sig.type === 'answer' || sig.type === 'ice') {
+    onRemoteRtcSignal(sig.type, sig.payload);
+  }
+}
+
+function startCall(peerUid, peerName, kind) {
+  if (call.status !== 'idle' || !peerUid) return;
+  call = { status: 'outgoing', peerUid, peerName, kind };
+  sendCallSignal(makeSignal('invite', peerUid, kind));
+  call.timeoutId = setTimeout(() => {
+    if (call.status === 'outgoing') {
+      sendCallSignal(makeSignal('cancel', peerUid, kind));
+      endCall('Pas de réponse');
+    }
+  }, CALL_RING_TIMEOUT_MS);
+  renderCallOverlay();
+}
+
+function acceptCall() {
+  if (call.status !== 'incoming') return;
+  clearTimeout(call.timeoutId);
+  const { peerUid, peerName, kind } = call;
+  call = { status: 'active', peerUid, peerName, kind, startedAt: Date.now(), micOn: true, camOn: kind === 'video', connected: false };
+  renderCallOverlay();
+  startWebRtc(false, kind, peerUid);
+  sendCallSignal(makeSignal('accept', peerUid, kind));
+}
+
+function rejectCall() {
+  if (call.status !== 'incoming') return;
+  clearTimeout(call.timeoutId);
+  const { peerUid, kind } = call;
+  call = { status: 'idle' };
+  renderCallOverlay();
+  sendCallSignal(makeSignal('reject', peerUid, kind));
+}
+
+function cancelOutgoingCall() {
+  if (call.status !== 'outgoing') return;
+  clearTimeout(call.timeoutId);
+  const { peerUid, kind } = call;
+  stopWebRtc();
+  call = { status: 'idle' };
+  renderCallOverlay();
+  sendCallSignal(makeSignal('cancel', peerUid, kind));
+}
+
+function hangupCall() {
+  if (call.status !== 'active') return;
+  const { peerUid, kind } = call;
+  endCall('Appel terminé');
+  sendCallSignal(makeSignal('end', peerUid, kind));
+}
+
+function endCall(reason) {
+  stopWebRtc();
+  call = { status: 'ended', reason };
+  renderCallOverlay();
+  setTimeout(() => {
+    if (call.status === 'ended') { call = { status: 'idle' }; renderCallOverlay(); }
+  }, 1500);
+}
+
+function toggleMic() {
+  if (call.status !== 'active' || !localCallStream) return;
+  call.micOn = !call.micOn;
+  localCallStream.getAudioTracks().forEach((t) => { t.enabled = call.micOn; });
+  updateCallUi();
+}
+
+function toggleCam() {
+  if (call.status !== 'active' || !localCallStream || call.kind !== 'video') return;
+  call.camOn = !call.camOn;
+  localCallStream.getVideoTracks().forEach((t) => { t.enabled = call.camOn; });
+  updateCallUi();
+}
+
+function callTimeLabel(startedAt) {
+  const s = Math.floor((Date.now() - startedAt) / 1000);
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+}
+
+function renderCallOverlay() {
+  const el = document.getElementById('callOverlay');
+  if (!el) return;
+  const enteringActive = call.status === 'active' && lastCallRenderStatus !== 'active';
+  lastCallRenderStatus = call.status;
+
+  if (call.status === 'idle') {
+    el.style.display = 'none';
+    el.innerHTML = '';
+    clearInterval(callTickTimer);
+    return;
+  }
+  el.style.display = 'flex';
+
+  if (call.status === 'outgoing') {
+    el.innerHTML = `
+      <div class="call-screen">
+        <div class="call-avatar">${escapeHtml(initialsFor(call.peerName))}</div>
+        <div class="call-name">${escapeHtml(call.peerName)}</div>
+        <div class="call-status">${call.kind === 'video' ? 'Appel vidéo…' : 'Appel…'}</div>
+        <div class="call-actions">
+          <button id="callCancelBtn" class="call-btn call-btn-end">📴</button>
+        </div>
+      </div>
+    `;
+    document.getElementById('callCancelBtn').addEventListener('click', cancelOutgoingCall);
+    return;
+  }
+
+  if (call.status === 'incoming') {
+    el.innerHTML = `
+      <div class="call-screen">
+        <div class="call-avatar">${escapeHtml(initialsFor(call.peerName))}</div>
+        <div class="call-name">${escapeHtml(call.peerName)}</div>
+        <div class="call-status">${call.kind === 'video' ? 'Appel vidéo entrant…' : 'Appel entrant…'}</div>
+        <div class="call-actions">
+          <button id="callRejectBtn" class="call-btn call-btn-end">📴</button>
+          <button id="callAcceptBtn" class="call-btn call-btn-accept">📞</button>
+        </div>
+      </div>
+    `;
+    document.getElementById('callRejectBtn').addEventListener('click', rejectCall);
+    document.getElementById('callAcceptBtn').addEventListener('click', acceptCall);
+    return;
+  }
+
+  if (call.status === 'ended') {
+    el.innerHTML = `<div class="call-screen"><div class="call-status">${escapeHtml(call.reason)}</div></div>`;
+    return;
+  }
+
+  // call.status === 'active'
+  if (enteringActive) {
+    el.innerHTML = call.kind === 'video' ? `
+      <div class="call-screen call-active">
+        <video id="callRemoteMedia" autoplay playsinline style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover;background:#000;"></video>
+        <video id="callLocalVideo" autoplay playsinline muted style="position:absolute;bottom:110px;right:16px;width:96px;height:130px;border-radius:12px;object-fit:cover;border:2px solid #fff;z-index:1;"></video>
+        <div class="call-name" style="position:absolute;top:max(16px, env(safe-area-inset-top));z-index:1;">${escapeHtml(call.peerName)}</div>
+        <div id="callStatusText" class="call-status" style="position:absolute;top:48px;z-index:1;">Connexion…</div>
+        <div class="call-actions" style="position:absolute;bottom:max(24px, env(safe-area-inset-bottom));z-index:1;">
+          <button id="callMicBtn" class="call-btn">🎙️</button>
+          <button id="callCamBtn" class="call-btn">📷</button>
+          <button id="callHangupBtn" class="call-btn call-btn-end">📴</button>
+        </div>
+      </div>
+    ` : `
+      <div class="call-screen call-active">
+        <audio id="callRemoteMedia" autoplay></audio>
+        <div class="call-avatar">${escapeHtml(initialsFor(call.peerName))}</div>
+        <div class="call-name">${escapeHtml(call.peerName)}</div>
+        <div id="callStatusText" class="call-status">Connexion…</div>
+        <div class="call-actions">
+          <button id="callMicBtn" class="call-btn">🎙️</button>
+          <button id="callHangupBtn" class="call-btn call-btn-end">📴</button>
+        </div>
+      </div>
+    `;
+    document.getElementById('callMicBtn').addEventListener('click', toggleMic);
+    const camBtn = document.getElementById('callCamBtn');
+    if (camBtn) camBtn.addEventListener('click', toggleCam);
+    document.getElementById('callHangupBtn').addEventListener('click', hangupCall);
+    clearInterval(callTickTimer);
+    callTickTimer = setInterval(() => { if (call.status === 'active') updateCallUi(); }, 1000);
+  }
+  updateCallUi();
+}
+
+/** Met à jour le contenu dynamique de l'écran d'appel actif sans reconstruire le DOM (évite de
+ * couper les flux vidéo/audio en cours en recréant les éléments <video>/<audio>). */
+function updateCallUi() {
+  if (call.status !== 'active') return;
+  const statusEl = document.getElementById('callStatusText');
+  if (statusEl) statusEl.textContent = call.connected ? callTimeLabel(call.startedAt) : 'Connexion…';
+  const micBtn = document.getElementById('callMicBtn');
+  if (micBtn) micBtn.textContent = call.micOn ? '🎙️' : '🔇';
+  const camBtn = document.getElementById('callCamBtn');
+  if (camBtn) camBtn.textContent = call.camOn ? '📷' : '🚫';
+  const localEl = document.getElementById('callLocalVideo');
+  if (localEl && localCallStream && localEl.srcObject !== localCallStream) localEl.srcObject = localCallStream;
+}
+
+// --- Moteur WebRTC (RTCPeerConnection natif du navigateur) ---
+
+const CALL_ICE_FALLBACK = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' },
+  { urls: 'stun:openrelay.metered.ca:80' },
+  { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
+];
+
+let callPc = null;
+let localCallStream = null;
+let pendingCallIce = [];
+let remoteCallSet = false;
+
+async function startWebRtc(isCaller, kind, peerUid) {
+  stopWebRtc();
+  remoteCallSet = false;
+  pendingCallIce = [];
+  const dedicated = cachedTurnServers.map((s) => ({ urls: s.urls, username: s.username, credential: s.credential }));
+  callPc = new RTCPeerConnection({ iceServers: [...dedicated, ...CALL_ICE_FALLBACK] });
+  callPc.onicecandidate = (e) => {
+    if (e.candidate) {
+      sendCallSignal(makeSignal('ice', peerUid, kind, { payload: `${e.candidate.sdpMid}|${e.candidate.sdpMLineIndex}|${e.candidate.candidate}` }));
+    }
+  };
+  callPc.ontrack = (e) => {
+    const remoteEl = document.getElementById('callRemoteMedia');
+    if (remoteEl && remoteEl.srcObject !== e.streams[0]) remoteEl.srcObject = e.streams[0];
+  };
+  callPc.oniceconnectionstatechange = () => {
+    if (callPc && (callPc.iceConnectionState === 'connected' || callPc.iceConnectionState === 'completed')) {
+      if (call.status === 'active') { call.connected = true; updateCallUi(); }
+    }
+  };
+  try {
+    localCallStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: kind === 'video' ? { facingMode: 'user' } : false });
+  } catch (err) {
+    endCall('Micro/caméra indisponible');
+    return;
+  }
+  localCallStream.getTracks().forEach((t) => callPc.addTrack(t, localCallStream));
+  updateCallUi();
+  if (isCaller) {
+    const offer = await callPc.createOffer();
+    await callPc.setLocalDescription(offer);
+    sendCallSignal(makeSignal('offer', peerUid, kind, { payload: offer.sdp }));
+  }
+}
+
+async function onRemoteRtcSignal(type, payload) {
+  if (!callPc) return;
+  try {
+    if (type === 'offer') {
+      await callPc.setRemoteDescription({ type: 'offer', sdp: payload });
+      remoteCallSet = true;
+      drainCallIce();
+      const answer = await callPc.createAnswer();
+      await callPc.setLocalDescription(answer);
+      if (call.peerUid) sendCallSignal(makeSignal('answer', call.peerUid, call.kind, { payload: answer.sdp }));
+    } else if (type === 'answer') {
+      await callPc.setRemoteDescription({ type: 'answer', sdp: payload });
+      remoteCallSet = true;
+      drainCallIce();
+    } else if (type === 'ice') {
+      const parts = payload.split('|');
+      if (parts.length >= 3) {
+        const cand = { sdpMid: parts[0] || null, sdpMLineIndex: parts[1] ? parseInt(parts[1], 10) : null, candidate: parts.slice(2).join('|') };
+        if (remoteCallSet) { try { await callPc.addIceCandidate(cand); } catch (_) {} } else pendingCallIce.push(cand);
+      }
+    }
+  } catch (_) {}
+}
+
+function drainCallIce() {
+  if (!callPc) return;
+  pendingCallIce.forEach((c) => callPc.addIceCandidate(c).catch(() => {}));
+  pendingCallIce = [];
+}
+
+function stopWebRtc() {
+  if (localCallStream) { localCallStream.getTracks().forEach((t) => t.stop()); localCallStream = null; }
+  if (callPc) { try { callPc.close(); } catch (_) {} callPc = null; }
+  remoteCallSet = false;
+  pendingCallIce = [];
+}
+
 // ---------- Démarrage ----------
 
 supabase.auth.onAuthStateChange((_event, session) => {
   if (session?.user) {
     set({ screen: 'main', user: session.user });
     loadMainData();
+    startCallListening(session.user.id);
   } else {
     if (currentChannel) { supabase.removeChannel(currentChannel); currentChannel = null; }
+    stopWebRtc();
+    call = { status: 'idle' };
+    renderCallOverlay();
+    Object.values(callChannels).forEach(({ channel }) => { try { supabase.removeChannel(channel); } catch (_) {} });
+    for (const k of Object.keys(callChannels)) delete callChannels[k];
     set({
       screen: 'auth', user: null, profile: null, members: [], identity: null,
       conversations: null, previews: {}, convKeysCache: {}, openConv: null, messages: null,
