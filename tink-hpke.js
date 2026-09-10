@@ -175,6 +175,56 @@ export function parseTinkAesGcmKeysetBinary(bytes) {
   return { keyId: key.keyId, rawKey: aesKey.keyValue };
 }
 
+// ---------- Écriture protobuf minimale (inverse du lecteur ci-dessus) ----------
+// Nécessaire pour créer de nouvelles conversations/groupes depuis le web (générer une clé de
+// conversation Tink et la chiffrer pour chaque membre) — jusqu'ici tink-hpke.js était lecture seule.
+
+function writeVarint(n) {
+  const bytes = [];
+  while (n > 0x7f) { bytes.push((n & 0x7f) | 0x80); n >>>= 7; }
+  bytes.push(n);
+  return new Uint8Array(bytes);
+}
+
+function concatBytes(...arrs) {
+  const total = arrs.reduce((s, a) => s + a.length, 0);
+  const out = new Uint8Array(total);
+  let o = 0;
+  for (const a of arrs) { out.set(a, o); o += a.length; }
+  return out;
+}
+
+function writeTag(field, wireType) { return writeVarint((field << 3) | wireType); }
+function writeVarintField(field, value) { return concatBytes(writeTag(field, 0), writeVarint(value)); }
+function writeLenDelim(field, bytes) { return concatBytes(writeTag(field, 2), writeVarint(bytes.length), bytes); }
+
+/** Construit un Keyset Tink binaire AES-256-GCM à un seul key (miroir de KeyManager.newConversationKey
+ * côté Android) : { keyId, rawKey(32o), keysetBinary(protobuf) }. keyId limité à [1, 0x7fffffff]
+ * pour rester sans ambiguïté d'encodage (évite la zone signée négative d'un varint int32). */
+export function newConversationKey() {
+  const rawKey = crypto.getRandomValues(new Uint8Array(32));
+  let keyId = crypto.getRandomValues(new Uint32Array(1))[0] & 0x7fffffff;
+  if (keyId === 0) keyId = 1;
+  // AesGcmKey { version=1:varint=0, key_value=3:bytes }
+  const aesGcmKeyBytes = concatBytes(writeVarintField(1, 0), writeLenDelim(3, rawKey));
+  // KeyData { type_url=1:string, value=2:bytes, key_material_type=3:varint(SYMMETRIC=1) }
+  const keyData = concatBytes(
+    writeLenDelim(1, new TextEncoder().encode(TYPE_AES_GCM)),
+    writeLenDelim(2, aesGcmKeyBytes),
+    writeVarintField(3, 1),
+  );
+  // Keyset.Key { key_data=1:bytes, status=2:varint(ENABLED=1), key_id=3:varint, output_prefix_type=4:varint(TINK=1) }
+  const keysetKey = concatBytes(
+    writeLenDelim(1, keyData),
+    writeVarintField(2, 1),
+    writeVarintField(3, keyId),
+    writeVarintField(4, 1),
+  );
+  // Keyset { primary_key_id=1:varint, key=2:bytes(repeated, un seul ici) }
+  const keysetBinary = concatBytes(writeVarintField(1, keyId), writeLenDelim(2, keysetKey));
+  return { keyId, rawKey, keysetBinary };
+}
+
 let _suitePromise = null;
 async function hpkeSuite() {
   if (!_suitePromise) {
@@ -198,6 +248,24 @@ export async function unwrapConversationKey(myPrivateKeyRaw, myKeyId, wrappedB64
   const recipient = await suite.createRecipientContext({ recipientKey: privKey, enc });
   const plain = new Uint8Array(await recipient.open(ct));
   return parseTinkAesGcmKeysetBinary(plain);
+}
+
+/**
+ * Chiffre (HPKE) une clé de conversation (keysetBinary, voir newConversationKey) pour la clé
+ * publique Tink d'un membre — miroir de KeyManager.wrapConversationKey (Android). [recipientPub]
+ * = { keyId, rawPublicKey } tel que retourné par parseTinkPublicKeyJson.
+ */
+export async function wrapConversationKey(recipientPub, keysetBinary) {
+  const suite = await hpkeSuite();
+  const pubKey = await suite.kem.importKey('raw', recipientPub.rawPublicKey, true);
+  const sender = await suite.createSenderContext({ recipientPublicKey: pubKey });
+  const ct = new Uint8Array(await sender.seal(keysetBinary));
+  const out = new Uint8Array(1 + 4 + 32 + ct.length);
+  out[0] = 1;
+  new DataView(out.buffer).setUint32(1, recipientPub.keyId, false);
+  out.set(new Uint8Array(sender.enc), 5);
+  out.set(ct, 37);
+  return bytesToBase64(out);
 }
 
 async function aesKeyFor(rawKey32) {
