@@ -1,5 +1,5 @@
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
-import { restoreIdentityFromBackup, unwrapConversationKey, decryptMessage, encryptMessage, decryptRaw, encryptRaw } from './tink-hpke.js';
+import { restoreIdentityFromBackup, unwrapConversationKey, decryptMessage, encryptMessage, decryptRaw, encryptRaw, newConversationKey, wrapConversationKey, parseTinkPublicKeyJson } from './tink-hpke.js';
 
 const MEDIA_BUCKET = 'media';
 
@@ -104,6 +104,10 @@ let state = {
   recording: false,
   recordElapsedMs: 0,
   videoProcessing: false,
+
+  // Nouveau groupe (modale sur l'accueil)
+  newGroupOpen: false,
+  newGroupBusy: false,
 };
 
 function set(patch) {
@@ -348,6 +352,91 @@ async function getConvKey(conv) {
   return key;
 }
 
+// ---------- Création de conversations/groupes (écriture de clés Tink — miroir de Conversations.kt) ----------
+
+function dmKeyOf(a, b) {
+  return [a, b].sort().join(':');
+}
+
+function myPublicKeyInfo() {
+  return { keyId: state.identity.keyId, rawPublicKey: state.identity.rawPublicKey };
+}
+
+/** Ouvre le DM avec [member] (le retrouve s'il existe, sinon le crée) puis l'affiche. */
+async function openOrCreateDmWeb(member) {
+  const me = state.user?.id;
+  if (!me || !member?.id || member.id === me) return;
+  try {
+    const key = dmKeyOf(me, member.id);
+    const { data: existing } = await supabase.from('conversations').select('*').eq('dm_key', key).maybeSingle();
+    let convId, encryptedKeyRow;
+    if (existing) {
+      const { data: myMember } = await supabase.from('conversation_members')
+        .select('encrypted_key').eq('conversation_id', existing.id).eq('user_id', me).maybeSingle();
+      if (!myMember?.encrypted_key) throw new Error('Conversation introuvable ou corrompue.');
+      convId = existing.id;
+      encryptedKeyRow = myMember.encrypted_key;
+    } else {
+      if (!member.public_key) throw new Error("Ce membre n'a pas encore de clé de chiffrement (il doit ouvrir l'app une fois).");
+      const { keysetBinary } = newConversationKey();
+      const otherPub = parseTinkPublicKeyJson(member.public_key);
+      const myWrapped = await wrapConversationKey(myPublicKeyInfo(), keysetBinary);
+      const otherWrapped = await wrapConversationKey(otherPub, keysetBinary);
+      const { data: conv, error: convErr } = await supabase.from('conversations')
+        .insert({ type: 'direct', dm_key: key, created_by: me }).select().single();
+      if (convErr) throw convErr;
+      const { error: memErr } = await supabase.from('conversation_members').insert([
+        { conversation_id: conv.id, user_id: me, encrypted_key: myWrapped },
+        { conversation_id: conv.id, user_id: member.id, encrypted_key: otherWrapped },
+      ]);
+      if (memErr) throw memErr;
+      convId = conv.id;
+      encryptedKeyRow = myWrapped;
+    }
+    const summary = {
+      id: convId, encryptedKey: encryptedKeyRow, isGroup: false, otherUid: member.id,
+      label: member.display_name?.trim() || member.email || member.id.slice(0, 8),
+      lastMessage: null, lastAt: null,
+    };
+    const list = state.conversations || [];
+    if (!list.some((c) => c.id === convId)) set({ conversations: [summary, ...list] });
+    openConversation(convId);
+  } catch (err) {
+    alert("Impossible d'ouvrir la conversation : " + (err.message || err));
+  }
+}
+
+/** Crée un groupe [name] avec [memberIds] (+ moi) — génère la clé de conv, la chiffre pour chaque
+ * membre ayant une clé publique. Retourne l'id créé, ou null en cas d'échec. */
+async function createGroupWeb(name, memberIds) {
+  const me = state.user?.id;
+  if (!me) return null;
+  try {
+    const ids = Array.from(new Set([...memberIds, me]));
+    const profiles = (state.members || []).filter((m) => ids.includes(m.id));
+    const { keysetBinary } = newConversationKey();
+    const { data: conv, error: convErr } = await supabase.from('conversations')
+      .insert({ type: 'group', dm_key: 'group:' + crypto.randomUUID(), created_by: me, name })
+      .select().single();
+    if (convErr) throw convErr;
+    const inserts = [];
+    for (const p of profiles) {
+      const pubInfo = p.id === me ? myPublicKeyInfo() : (p.public_key ? parseTinkPublicKeyJson(p.public_key) : null);
+      if (!pubInfo) continue;
+      const wrapped = await wrapConversationKey(pubInfo, keysetBinary);
+      inserts.push({ conversation_id: conv.id, user_id: p.id, encrypted_key: wrapped });
+    }
+    if (inserts.length) {
+      const { error: memErr } = await supabase.from('conversation_members').insert(inserts);
+      if (memErr) throw memErr;
+    }
+    return conv.id;
+  } catch (err) {
+    alert('Impossible de créer le groupe : ' + (err.message || err));
+    return null;
+  }
+}
+
 function previewLabelFor(msg) {
   if (!msg) return 'Nouvelle conversation';
   if (msg.type === 'image') return '📷 Photo';
@@ -469,13 +558,14 @@ function renderMain() {
           </div>
         `).join('')}
 
-    <div style="padding:14px 20px 4px;font-size:13px;font-weight:700;color:var(--green);">
-      Membres du cercle (${members.length})
+    <div style="padding:14px 20px 4px;display:flex;align-items:center;justify-content:space-between;">
+      <span style="font-size:13px;font-weight:700;color:var(--green);">Membres du cercle (${members.length})</span>
+      <button type="button" id="newGroupBtn" style="background:none;border:1px solid var(--green);color:var(--green);border-radius:14px;padding:4px 10px;font-size:12px;cursor:pointer;">+ Groupe</button>
     </div>
     ${members.length === 0
       ? `<div class="empty">Aucun membre.</div>`
       : members.map((m) => `
-        <div class="list-item">
+        <div class="list-item" data-member="${m.id}" style="cursor:pointer;">
           <div class="avatar" style="width:36px;height:36px;font-size:14px;">${escapeHtml(initialsFor(m.display_name || m.email))}</div>
           <div>
             <div class="name">${escapeHtml(m.display_name?.trim() || m.email || m.id.slice(0, 8))}</div>
@@ -483,6 +573,7 @@ function renderMain() {
           </div>
         </div>
       `).join('')}
+    ${renderNewGroupModal()}
   `;
 
   document.getElementById('signOutBtn').addEventListener('click', async () => {
@@ -493,6 +584,59 @@ function renderMain() {
   document.querySelectorAll('[data-conv]').forEach((el) => {
     el.addEventListener('click', () => openConversation(el.dataset.conv));
   });
+  document.querySelectorAll('[data-member]').forEach((el) => {
+    el.addEventListener('click', () => {
+      const m = (state.members || []).find((x) => x.id === el.dataset.member);
+      if (m) openOrCreateDmWeb(m);
+    });
+  });
+  const newGroupBtn = document.getElementById('newGroupBtn');
+  if (newGroupBtn) newGroupBtn.addEventListener('click', () => set({ newGroupOpen: true }));
+  wireNewGroupModalEvents();
+}
+
+function renderNewGroupModal() {
+  if (!state.newGroupOpen) return '';
+  const members = (state.members || []).filter((m) => m.id !== state.user?.id && m.status === 'active');
+  return `
+    <div id="newGroupOverlay" style="position:fixed;inset:0;background:rgba(0,0,0,0.5);display:flex;align-items:center;justify-content:center;z-index:50;padding:20px;">
+      <div style="background:#fff;border-radius:14px;padding:20px;max-width:420px;width:100%;max-height:80vh;overflow-y:auto;">
+        <div style="font-weight:700;font-size:16px;margin-bottom:12px;color:var(--forest);">Nouveau groupe</div>
+        <input type="text" id="newGroupName" placeholder="Nom du groupe"
+               style="width:100%;padding:10px 14px;border:1px solid #cfc9bd;border-radius:10px;font-size:15px;margin-bottom:12px;box-sizing:border-box;" />
+        <div style="font-size:13px;font-weight:700;color:var(--green);margin-bottom:6px;">Membres</div>
+        ${members.length === 0 ? `<div class="empty">Aucun membre.</div>` : members.map((m) => `
+          <label style="display:flex;align-items:center;gap:10px;padding:8px 0;cursor:pointer;">
+            <input type="checkbox" data-newgroup-member="${m.id}" />
+            <span>${escapeHtml(m.display_name?.trim() || m.email || m.id.slice(0, 8))}</span>
+          </label>
+        `).join('')}
+        ${state.newGroupBusy ? `<div class="hint" style="margin-top:8px;">Création…</div>` : ''}
+        <div style="display:flex;gap:10px;margin-top:16px;">
+          <button type="button" id="newGroupCancel" style="flex:1;padding:10px;border-radius:10px;border:1px solid #cfc9bd;background:#fff;cursor:pointer;" ${state.newGroupBusy ? 'disabled' : ''}>Annuler</button>
+          <button type="button" id="newGroupCreate" class="primary" style="flex:1;margin-top:0;" ${state.newGroupBusy ? 'disabled' : ''}>Créer</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function wireNewGroupModalEvents() {
+  const cancelBtn = document.getElementById('newGroupCancel');
+  if (cancelBtn) cancelBtn.addEventListener('click', () => set({ newGroupOpen: false }));
+  const createBtn = document.getElementById('newGroupCreate');
+  if (createBtn) {
+    createBtn.addEventListener('click', async () => {
+      const name = document.getElementById('newGroupName').value.trim();
+      const selected = Array.from(document.querySelectorAll('[data-newgroup-member]:checked')).map((el) => el.dataset.newgroupMember);
+      if (!name) { alert('Donne un nom au groupe.'); return; }
+      if (selected.length === 0) { alert('Sélectionne au moins un membre.'); return; }
+      set({ newGroupBusy: true });
+      const id = await createGroupWeb(name, selected);
+      set({ newGroupBusy: false, newGroupOpen: false });
+      if (id) await loadConversations();
+    });
+  }
 }
 
 // ---------- Conversation ouverte ----------
