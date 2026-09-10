@@ -561,40 +561,42 @@ function renderMain() {
       <button class="signout" id="signOutBtn" style="${profile?.role === 'owner' ? 'margin-left:12px;' : 'margin-left:auto;'}">Se déconnecter</button>
     </div>
 
-    ${!state.identity ? renderUnlockCard() : ''}
+    <div style="flex:1;min-height:0;overflow-y:auto;">
+      ${!state.identity ? renderUnlockCard() : ''}
 
-    <div style="padding:14px 20px 4px;font-size:13px;font-weight:700;color:var(--green);">
-      Conversations ${convs ? `(${convs.length})` : ''}
-    </div>
-    ${convs === null
-      ? `<div class="empty">Chargement…</div>`
-      : convs.length === 0
-        ? `<div class="empty">Aucune conversation.</div>`
-        : convs.map((c) => `
-          <div class="list-item" data-conv="${c.id}" style="cursor:pointer;">
-            <div class="avatar" style="width:40px;height:40px;">${escapeHtml(initialsFor(c.label))}</div>
-            <div style="flex:1;min-width:0;">
-              <div class="name">${escapeHtml(c.label)}${c.isGroup ? ' 👥' : ''}</div>
-              <div class="preview">${escapeHtml(state.identity ? (state.previews[c.id] ?? '…') : '🔒 verrouillé')}</div>
+      <div style="padding:14px 20px 4px;font-size:13px;font-weight:700;color:var(--green);">
+        Conversations ${convs ? `(${convs.length})` : ''}
+      </div>
+      ${convs === null
+        ? `<div class="empty">Chargement…</div>`
+        : convs.length === 0
+          ? `<div class="empty">Aucune conversation.</div>`
+          : convs.map((c) => `
+            <div class="list-item" data-conv="${c.id}" style="cursor:pointer;">
+              <div class="avatar" style="width:40px;height:40px;">${escapeHtml(initialsFor(c.label))}</div>
+              <div style="flex:1;min-width:0;">
+                <div class="name">${escapeHtml(c.label)}${c.isGroup ? ' 👥' : ''}</div>
+                <div class="preview">${escapeHtml(state.identity ? (state.previews[c.id] ?? '…') : '🔒 verrouillé')}</div>
+              </div>
+            </div>
+          `).join('')}
+
+      <div style="padding:14px 20px 4px;display:flex;align-items:center;justify-content:space-between;">
+        <span style="font-size:13px;font-weight:700;color:var(--green);">Membres du cercle (${members.length})</span>
+        <button type="button" id="newGroupBtn" style="background:none;border:1px solid var(--green);color:var(--green);border-radius:14px;padding:4px 10px;font-size:12px;cursor:pointer;">+ Groupe</button>
+      </div>
+      ${members.length === 0
+        ? `<div class="empty">Aucun membre.</div>`
+        : members.map((m) => `
+          <div class="list-item" data-member="${m.id}" style="cursor:pointer;">
+            <div class="avatar" style="width:36px;height:36px;font-size:14px;">${escapeHtml(initialsFor(m.display_name || m.email))}</div>
+            <div>
+              <div class="name">${escapeHtml(m.display_name?.trim() || m.email || m.id.slice(0, 8))}</div>
+              ${m.display_name?.trim() && m.email ? `<div class="preview">${escapeHtml(m.email)}</div>` : ''}
             </div>
           </div>
         `).join('')}
-
-    <div style="padding:14px 20px 4px;display:flex;align-items:center;justify-content:space-between;">
-      <span style="font-size:13px;font-weight:700;color:var(--green);">Membres du cercle (${members.length})</span>
-      <button type="button" id="newGroupBtn" style="background:none;border:1px solid var(--green);color:var(--green);border-radius:14px;padding:4px 10px;font-size:12px;cursor:pointer;">+ Groupe</button>
     </div>
-    ${members.length === 0
-      ? `<div class="empty">Aucun membre.</div>`
-      : members.map((m) => `
-        <div class="list-item" data-member="${m.id}" style="cursor:pointer;">
-          <div class="avatar" style="width:36px;height:36px;font-size:14px;">${escapeHtml(initialsFor(m.display_name || m.email))}</div>
-          <div>
-            <div class="name">${escapeHtml(m.display_name?.trim() || m.email || m.id.slice(0, 8))}</div>
-            ${m.display_name?.trim() && m.email ? `<div class="preview">${escapeHtml(m.email)}</div>` : ''}
-          </div>
-        </div>
-      `).join('')}
     ${renderNewGroupModal()}
   `;
 
@@ -786,7 +788,7 @@ function renderConversation() {
         <button id="callVideoBtn" style="background:none;border:none;color:#fff;font-size:18px;cursor:pointer;padding:4px 8px;">🎥</button>
       ` : ''}
     </div>
-    <div id="msgList" style="flex:1;overflow-y:auto;padding:14px 16px;display:flex;flex-direction:column;gap:8px;">
+    <div id="msgList" style="flex:1;min-height:0;overflow-y:auto;padding:14px 16px;display:flex;flex-direction:column;gap:8px;">
       ${msgs === null ? `<div class="spinner"></div>` :
         msgs.length === 0 ? `<div class="empty">Aucun message. Écris le premier — il sera chiffré de bout en bout. 🔒</div>` :
         msgs.map((m) => `
@@ -1856,7 +1858,7 @@ function renderAdmin() {
       <button id="adminBackBtn" style="background:none;border:none;color:#fff;font-size:20px;cursor:pointer;padding:0 6px 0 0;">‹</button>
       <span>Administration</span>
     </div>
-    <div style="flex:1;overflow-y:auto;padding:16px 20px;">
+    <div style="flex:1;min-height:0;overflow-y:auto;padding:16px 20px;">
       ${renderUsageSection(a.usage)}
       ${renderMembersSection(a)}
       ${renderPendingInvitesSection(a)}
