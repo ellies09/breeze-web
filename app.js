@@ -108,6 +108,26 @@ let state = {
   // Nouveau groupe (modale sur l'accueil)
   newGroupOpen: false,
   newGroupBusy: false,
+
+  // Administration (owner) — miroir de SettingsScreen.AdminView côté Android
+  showAdmin: false,
+  admin: {
+    members: null,         // liste complète des profils (dont role/status/category)
+    allowlist: null,       // e-mails invités (table allowlist)
+    conversations: null,   // AdminConversationSummary[]
+    joinRequests: null,    // demandes d'ajout en attente
+    usage: null,           // UsageStats
+    busy: false,
+    memberSearch: '',
+    memberShowCount: 10,
+    convSearch: '',
+    convShowCount: 10,
+    statusTargetId: null,      // id du membre dont on édite statut/catégorie
+    confirmRevokeEmail: null,
+    confirmDeleteConvId: null,
+    confirmGlobalPurge: false,
+    purgeResult: null,
+  },
 };
 
 function set(patch) {
@@ -136,6 +156,7 @@ function friendlyAuthError(message, isSignUp) {
 function render() {
   if (state.screen === 'loading') return renderLoading();
   if (state.screen === 'auth') return renderAuth();
+  if (state.showAdmin) return renderAdmin();
   if (state.openConv) return renderConversation();
   return renderMain();
 }
@@ -536,7 +557,8 @@ function renderMain() {
         <div class="profile-name">${escapeHtml(displayName)}</div>
         <div class="profile-email">${escapeHtml(email)}</div>
       </div>
-      <button class="signout" id="signOutBtn">Se déconnecter</button>
+      ${profile?.role === 'owner' ? `<button class="signout" id="adminBtn" style="color:var(--green);margin-left:auto;">⚙ Administration</button>` : ''}
+      <button class="signout" id="signOutBtn" style="${profile?.role === 'owner' ? 'margin-left:12px;' : 'margin-left:auto;'}">Se déconnecter</button>
     </div>
 
     ${!state.identity ? renderUnlockCard() : ''}
@@ -580,6 +602,8 @@ function renderMain() {
     try { await clearIdentityCache(state.user?.id); } catch (_) {}
     await supabase.auth.signOut();
   });
+  const adminBtn = document.getElementById('adminBtn');
+  if (adminBtn) adminBtn.addEventListener('click', () => { set({ showAdmin: true }); loadAdminData(); });
   wireUnlockEvents();
   document.querySelectorAll('[data-conv]').forEach((el) => {
     el.addEventListener('click', () => openConversation(el.dataset.conv));
@@ -1652,6 +1676,547 @@ function stopWebRtc() {
   if (callPc) { try { callPc.close(); } catch (_) {} callPc = null; }
   remoteCallSet = false;
   pendingCallIce = [];
+}
+
+// ---------- Administration (owner) — miroir de Profile.kt/Conversations.kt/JoinRequests.kt/SettingsScreen.AdminView ----------
+
+function setAdmin(patch) {
+  set({ admin: { ...state.admin, ...patch } });
+}
+
+function categoryLabel(c) {
+  return { famille: '👨‍👩‍👧 Famille', amis: '🎉 Amis', collegues: '💼 Collègues', special: '🔒 Spécial' }[c] || c;
+}
+
+/** « vu à HH:mm » / « vu hier à HH:mm » / « vu le dd/MM à HH:mm », ou null. Miroir de lastSeenLabel (Android). */
+function lastSeenLabel(iso) {
+  if (!iso) return null;
+  try {
+    const d = new Date(iso);
+    const now = new Date();
+    const hm = d.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+    if (d.toDateString() === now.toDateString()) return `vu à ${hm}`;
+    const yesterday = new Date(now); yesterday.setDate(now.getDate() - 1);
+    if (d.toDateString() === yesterday.toDateString()) return `vu hier à ${hm}`;
+    return `vu le ${d.toLocaleDateString('fr-FR', { day: '2-digit', month: '2-digit' })} à ${hm}`;
+  } catch (_) { return null; }
+}
+
+/** Filet « en ligne » basé sur la fraîcheur de last_seen (même seuil que le fallback Android, 75s). */
+function isRecentlyActive(iso) {
+  if (!iso) return false;
+  try { return (Date.now() - new Date(iso).getTime()) < 75_000; } catch (_) { return false; }
+}
+
+async function fetchAllowlistWeb() {
+  const { data } = await supabase.from('allowlist').select('email');
+  return (data || []).map((r) => r.email);
+}
+
+async function revokeInviteWeb(email) {
+  await supabase.from('allowlist').delete().eq('email', email);
+}
+
+async function setMemberStatusWeb(uid, status) {
+  await supabase.from('profiles').update({ status }).eq('id', uid);
+}
+
+async function setMemberCategoryWeb(uid, category) {
+  await supabase.from('profiles').update({ category }).eq('id', uid);
+}
+
+/** Invite un e-mail : hérite de MA catégorie, moi comme parrain — miroir d'inviteEmail (Profile.kt). */
+async function inviteEmailWeb(email) {
+  const e = (email || '').trim().toLowerCase();
+  const me = state.user.id;
+  const { data: excluded } = await supabase.from('profiles').select('id').eq('email', e).eq('status', 'excluded');
+  if (excluded && excluded.length) {
+    throw new Error('Cette personne est exclue. Retire-la des exclus avant de la réinviter.');
+  }
+  const { data: mine } = await supabase.from('profiles').select('category').eq('id', me).maybeSingle();
+  const { error } = await supabase.from('allowlist').insert({ email: e, category: mine?.category || 'amis', sponsor_id: me });
+  if (error) throw error;
+}
+
+async function fetchJoinRequestsWeb() {
+  const { data } = await supabase.from('join_requests').select('*').eq('status', 'pending').order('created_at', { ascending: false });
+  return data || [];
+}
+
+async function resolveJoinRequestWeb(id, accepted) {
+  await supabase.from('join_requests').update({ status: accepted ? 'accepted' : 'rejected' }).eq('id', id);
+}
+
+async function deleteMediaObjectWeb(path) {
+  try { await supabase.storage.from(MEDIA_BUCKET).remove([path]); } catch (_) {}
+}
+
+/** [OWNER] Métadonnées seulement (jamais le contenu, chiffré et illisible sans être membre). */
+async function fetchAllConversationsAdminWeb() {
+  const { data: convs } = await supabase.from('conversations').select('*');
+  const result = [];
+  for (const c of convs || []) {
+    const { data: members } = await supabase.from('conversation_members').select('conversation_id').eq('conversation_id', c.id);
+    const { data: lastRows } = await supabase.from('messages').select('sent_at')
+      .eq('conversation_id', c.id).order('sent_at', { ascending: false }).limit(1);
+    const label = c.type === 'group' ? (c.name || 'Groupe sans nom') : `DM (${(members || []).length} membres)`;
+    result.push({
+      id: c.id, type: c.type || 'direct', label, memberCount: (members || []).length,
+      lastAt: lastRows?.[0]?.sent_at || null, archived: !!c.archived,
+    });
+  }
+  result.sort((a, b) => (b.lastAt || '').localeCompare(a.lastAt || ''));
+  return result;
+}
+
+async function setConversationArchivedWeb(id, archived) {
+  await supabase.from('conversations').update({ archived }).eq('id', id);
+}
+
+/** [OWNER] Supprime définitivement une conversation (messages, médias, adhésions, ligne). */
+async function deleteConversationAdminWeb(id) {
+  const { data: rows } = await supabase.from('messages').select('media_path').eq('conversation_id', id);
+  for (const r of rows || []) {
+    if (r.media_path) { await deleteMediaObjectWeb(r.media_path); await deleteMediaObjectWeb(r.media_path + '.thumb'); }
+  }
+  await supabase.from('messages').delete().eq('conversation_id', id);
+  await supabase.from('conversation_members').delete().eq('conversation_id', id);
+  await supabase.from('conversations').delete().eq('id', id);
+}
+
+/** [OWNER] Purge globale : supprime tous les messages+médias, garde conversations et adhésions. */
+async function globalPurgeAllMessagesWeb() {
+  const { data: rows } = await supabase.from('messages').select('media_path');
+  for (const r of rows || []) {
+    if (r.media_path) { await deleteMediaObjectWeb(r.media_path); await deleteMediaObjectWeb(r.media_path + '.thumb'); }
+  }
+  await supabase.from('messages').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+  return (rows || []).length;
+}
+
+/** Chiffres réels (comptages Postgres + RPC taille DB/Storage) — miroir de fetchUsageStats (Kotlin). */
+async function fetchUsageStatsWeb() {
+  const [msgCountRes, memberCountRes, convCountRes, mediaRes] = await Promise.all([
+    supabase.from('messages').select('*', { count: 'exact', head: true }),
+    supabase.from('profiles').select('*', { count: 'exact', head: true }),
+    supabase.from('conversations').select('*', { count: 'exact', head: true }),
+    supabase.from('messages').select('media_size'),
+  ]);
+  const mediaBytes = (mediaRes.data || []).reduce((sum, r) => sum + (r.media_size || 0), 0);
+  let dbSizeBytes = null, storageSizeBytes = null;
+  try { const { data } = await supabase.rpc('get_database_size_bytes'); dbSizeBytes = data != null ? Number(data) : null; } catch (_) {}
+  try { const { data } = await supabase.rpc('get_storage_size_bytes'); storageSizeBytes = data != null ? Number(data) : null; } catch (_) {}
+  return {
+    messageCount: msgCountRes.count || 0, memberCount: memberCountRes.count || 0, conversationCount: convCountRes.count || 0,
+    mediaBytes, dbSizeBytes, storageSizeBytes,
+  };
+}
+
+async function loadAdminData() {
+  setAdmin({ members: null, allowlist: null, conversations: null, joinRequests: null, usage: null, purgeResult: null });
+  try {
+    const { data: members } = await supabase.from('profiles').select('*');
+    const allowlist = await fetchAllowlistWeb();
+    setAdmin({ members: members || [], allowlist });
+  } catch (_) {
+    setAdmin({ members: [], allowlist: [] });
+  }
+  try {
+    setAdmin({ conversations: await fetchAllConversationsAdminWeb() });
+  } catch (_) {
+    setAdmin({ conversations: [] });
+  }
+  try {
+    setAdmin({ joinRequests: await fetchJoinRequestsWeb() });
+  } catch (_) {
+    setAdmin({ joinRequests: [] });
+  }
+  try {
+    setAdmin({ usage: await fetchUsageStatsWeb() });
+  } catch (_) {
+    setAdmin({ usage: null });
+  }
+}
+
+function renderAdmin() {
+  const a = state.admin;
+  app.innerHTML = `
+    <div class="topbar">
+      <button id="adminBackBtn" style="background:none;border:none;color:#fff;font-size:20px;cursor:pointer;padding:0 6px 0 0;">‹</button>
+      <span>Administration</span>
+    </div>
+    <div style="flex:1;overflow-y:auto;padding:16px 20px;">
+      ${renderUsageSection(a.usage)}
+      ${renderMembersSection(a)}
+      ${renderPendingInvitesSection(a)}
+      ${renderJoinRequestsSection(a)}
+      ${renderConversationsSection(a)}
+      ${renderDangerZoneSection(a)}
+    </div>
+    ${renderStatusModal(a)}
+    ${renderConfirmRevokeModal(a)}
+    ${renderConfirmDeleteConvModal(a)}
+    ${renderConfirmGlobalPurgeModal(a)}
+  `;
+  document.getElementById('adminBackBtn').addEventListener('click', () => set({ showAdmin: false }));
+  wireAdminEvents();
+}
+
+const ADMIN_HR = `<hr style="border:none;border-top:1px solid #e5e0d5;margin-bottom:16px;" />`;
+
+function renderUsageSection(u) {
+  let body;
+  if (!u) {
+    body = `<div class="hint" style="margin:0;">Chargement…</div>`;
+  } else {
+    const dbLine = u.dbSizeBytes != null
+      ? `🗄️ Base de données : ${(u.dbSizeBytes / 1_000_000).toFixed(1)} Mo / 500 Mo (${(u.dbSizeBytes / 5_000_000).toFixed(1)}%)`
+      : `🗄️ Base de données : indisponible`;
+    const storageLine = u.storageSizeBytes != null
+      ? `📦 Stockage (médias/avatars) : ${(u.storageSizeBytes / 1_000_000).toFixed(1)} Mo / 1000 Mo (${(u.storageSizeBytes / 10_000_000).toFixed(1)}%)`
+      : `📦 Médias envoyés : ~${(u.mediaBytes / 1_000_000).toFixed(1)} Mo (estimation)`;
+    body = `
+      <div style="font-size:13px;">💬 ${u.messageCount} messages · 👥 ${u.memberCount} membres · 🗂️ ${u.conversationCount} conversations</div>
+      <div style="font-size:13px;margin-top:4px;">${dbLine}</div>
+      <div style="font-size:13px;margin-top:4px;">${storageLine}</div>
+    `;
+  }
+  return `
+    <div style="margin-bottom:20px;">
+      <div style="font-size:16px;font-weight:700;color:var(--forest);margin-bottom:6px;">📊 Utilisation</div>
+      ${body}
+    </div>
+    ${ADMIN_HR}
+  `;
+}
+
+function renderMembersSection(a) {
+  const members = a.members;
+  if (members === null) {
+    return `<div style="margin-bottom:20px;"><div style="font-size:16px;font-weight:700;color:var(--forest);margin-bottom:6px;">Membres</div><div class="spinner"></div></div>${ADMIN_HR}`;
+  }
+  const membersById = {};
+  members.forEach((m) => { membersById[m.id] = m; });
+  const q = (a.memberSearch || '').toLowerCase();
+  const filtered = members
+    .filter((m) => !q || (m.display_name || '').toLowerCase().includes(q) || (m.email || '').toLowerCase().includes(q))
+    .sort((x, y) => (y.last_seen || '').localeCompare(x.last_seen || ''));
+  const visible = filtered.slice(0, a.memberShowCount);
+  const rows = visible.map((m) => {
+    const label = (m.display_name || '').trim() || m.email || m.id.slice(0, 8);
+    const seen = lastSeenLabel(m.last_seen);
+    let badge = isRecentlyActive(m.last_seen) ? '● en ligne' : (seen || 'hors ligne');
+    badge += '  ' + categoryLabel(m.category || 'amis');
+    if (m.role === 'owner') badge += '  ★ owner';
+    if (m.status && m.status !== 'active') badge += `  — ${m.status}`;
+    const sponsor = m.sponsor_id ? membersById[m.sponsor_id] : null;
+    const sponsorLabel = sponsor ? ((sponsor.display_name || '').trim() || sponsor.email || sponsor.id.slice(0, 8)) : null;
+    return `
+      <div class="list-item" data-admin-member="${m.id}" style="cursor:pointer;">
+        <div class="avatar" style="width:40px;height:40px;">${escapeHtml(initialsFor(label))}</div>
+        <div style="flex:1;min-width:0;">
+          <div class="name">${escapeHtml(label)}</div>
+          ${m.display_name?.trim() && m.email ? `<div class="preview">${escapeHtml(m.email)}</div>` : ''}
+          <div style="font-size:11px;color:${m.status && m.status !== 'active' ? 'var(--error)' : 'var(--sage)'};">${escapeHtml(badge)}</div>
+          ${sponsorLabel ? `<div style="font-size:10px;color:var(--sage);">invité par ${escapeHtml(sponsorLabel)}</div>` : ''}
+        </div>
+        <span style="color:var(--sage);">⚙</span>
+      </div>
+    `;
+  }).join('');
+  const more = filtered.length > a.memberShowCount
+    ? `<button type="button" id="memberShowMoreBtn" style="width:100%;padding:10px;background:none;border:none;color:var(--green);font-weight:700;cursor:pointer;">Afficher plus (+${Math.min(10, filtered.length - a.memberShowCount)})</button>`
+    : '';
+  return `
+    <div style="margin-bottom:20px;">
+      <div style="font-size:16px;font-weight:700;color:var(--forest);margin-bottom:6px;">Membres (${members.length})</div>
+      <input type="text" id="memberSearchInput" placeholder="Rechercher un membre…" value="${escapeHtml(a.memberSearch || '')}"
+             style="width:100%;padding:10px 14px;border:1px solid #cfc9bd;border-radius:10px;font-size:14px;margin-bottom:8px;box-sizing:border-box;" />
+      ${rows || '<div class="empty">Aucun membre.</div>'}
+      ${more}
+    </div>
+    ${ADMIN_HR}
+  `;
+}
+
+function renderPendingInvitesSection(a) {
+  const members = a.members || [];
+  const memberEmails = new Set(members.map((m) => (m.email || '').toLowerCase()));
+  const pending = (a.allowlist || []).filter((e) => !memberEmails.has((e || '').toLowerCase()));
+  const rows = pending.map((email) => `
+    <div style="display:flex;align-items:center;gap:8px;padding:6px 0;">
+      <span style="flex:1;font-size:14px;">${escapeHtml(email)}</span>
+      <button type="button" data-revoke-email="${escapeHtml(email)}" style="background:none;border:none;color:var(--error);font-size:13px;cursor:pointer;">Révoquer</button>
+    </div>
+  `).join('');
+  return `
+    <div style="margin-bottom:20px;">
+      <div style="font-size:16px;font-weight:700;color:var(--forest);margin-bottom:6px;">Invitations en attente (${pending.length})</div>
+      ${rows || '<div class="hint" style="margin:0;">Aucune invitation en attente.</div>'}
+    </div>
+    ${ADMIN_HR}
+  `;
+}
+
+function renderJoinRequestsSection(a) {
+  const requests = a.joinRequests;
+  if (requests === null) {
+    return `<div style="margin-bottom:20px;"><div style="font-size:16px;font-weight:700;color:var(--forest);margin-bottom:6px;">Demandes d'ajout</div><div class="spinner"></div></div>${ADMIN_HR}`;
+  }
+  const rows = requests.map((r) => `
+    <div style="padding:10px 0;border-bottom:1px solid #eee8db;">
+      <div style="font-weight:700;font-size:14px;">${escapeHtml(r.name)}</div>
+      <div style="font-size:12px;color:var(--sage);">${escapeHtml(r.contact)}</div>
+      ${r.message ? `<div style="font-size:13px;margin-top:2px;">${escapeHtml(r.message)}</div>` : ''}
+      <div style="margin-top:6px;">
+        <button type="button" data-jr-accept="${r.id}" data-jr-email="${escapeHtml(r.contact)}" style="background:none;border:none;color:var(--green);font-weight:700;font-size:13px;cursor:pointer;margin-right:14px;">Inviter</button>
+        <button type="button" data-jr-reject="${r.id}" style="background:none;border:none;color:var(--error);font-size:13px;cursor:pointer;">Rejeter</button>
+      </div>
+    </div>
+  `).join('');
+  return `
+    <div style="margin-bottom:20px;">
+      <div style="font-size:16px;font-weight:700;color:var(--forest);margin-bottom:6px;">Demandes d'ajout (${requests.length})</div>
+      ${rows || '<div class="hint" style="margin:0;">Aucune demande en attente.</div>'}
+    </div>
+    ${ADMIN_HR}
+  `;
+}
+
+function renderConversationsSection(a) {
+  const convs = a.conversations;
+  if (convs === null) {
+    return `<div style="margin-bottom:20px;"><div style="font-size:16px;font-weight:700;color:var(--forest);margin-bottom:2px;">Toutes les conversations</div><div class="spinner"></div></div>${ADMIN_HR}`;
+  }
+  const q = (a.convSearch || '').toLowerCase();
+  const filtered = convs.filter((c) => !q || c.label.toLowerCase().includes(q));
+  const visible = filtered.slice(0, a.convShowCount);
+  const rows = visible.map((c) => `
+    <div style="display:flex;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid #eee8db;">
+      <div style="flex:1;min-width:0;">
+        <div style="font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${c.archived ? '🗄️ ' : ''}${escapeHtml(c.label)}</div>
+        <div style="font-size:11px;color:var(--sage);">${c.memberCount} membre(s)${c.lastAt ? ' · actif récemment' : ' · vide'}</div>
+      </div>
+      <button type="button" data-conv-archive="${c.id}" data-conv-archived="${c.archived ? '1' : '0'}" style="background:none;border:none;color:var(--green);font-size:12px;cursor:pointer;white-space:nowrap;">${c.archived ? 'Désarchiver' : 'Archiver'}</button>
+      <button type="button" data-conv-delete="${c.id}" style="background:none;border:none;color:var(--error);font-size:12px;cursor:pointer;">Suppr.</button>
+    </div>
+  `).join('');
+  const more = filtered.length > a.convShowCount
+    ? `<button type="button" id="convShowMoreBtn" style="width:100%;padding:10px;background:none;border:none;color:var(--green);font-weight:700;cursor:pointer;">Afficher plus (+${Math.min(10, filtered.length - a.convShowCount)})</button>`
+    : '';
+  return `
+    <div style="margin-bottom:20px;">
+      <div style="font-size:16px;font-weight:700;color:var(--forest);margin-bottom:2px;">Toutes les conversations (${convs.length})</div>
+      <div style="font-size:11px;color:var(--sage);margin-bottom:8px;">Métadonnées seulement (nom/type, membres, activité) — le contenu reste chiffré, illisible sans en être membre.</div>
+      <input type="text" id="convSearchInput" placeholder="Rechercher une conversation…" value="${escapeHtml(a.convSearch || '')}"
+             style="width:100%;padding:10px 14px;border:1px solid #cfc9bd;border-radius:10px;font-size:14px;margin-bottom:8px;box-sizing:border-box;" />
+      ${rows || '<div class="empty">Aucune conversation.</div>'}
+      ${more}
+    </div>
+    ${ADMIN_HR}
+  `;
+}
+
+function renderDangerZoneSection(a) {
+  return `
+    <div style="margin-bottom:24px;">
+      <div style="font-size:15px;font-weight:700;color:var(--error);margin-bottom:8px;">Zone dangereuse</div>
+      <button type="button" id="globalPurgeBtn" ${a.busy ? 'disabled' : ''}
+              style="width:100%;padding:12px;border:1px solid var(--error);border-radius:10px;background:none;color:var(--error);font-size:14px;cursor:pointer;">
+        🧨 Purge globale de tous les messages
+      </button>
+      ${a.purgeResult ? `<div style="font-size:13px;color:var(--sage);margin-top:6px;">${escapeHtml(a.purgeResult)}</div>` : ''}
+    </div>
+  `;
+}
+
+function renderStatusModal(a) {
+  if (!a.statusTargetId) return '';
+  const m = (a.members || []).find((x) => x.id === a.statusTargetId);
+  if (!m) return '';
+  const label = (m.display_name || '').trim() || m.email || m.id.slice(0, 8);
+  const isSelf = m.id === state.user?.id;
+  const categories = ['famille', 'amis', 'collegues', 'special'];
+  const statuses = [['active', '✅ Actif (visible)'], ['hidden', '🙈 Masqué de l\'annuaire'], ['excluded', '🚫 Exclu']];
+  return `
+    <div style="position:fixed;inset:0;background:rgba(0,0,0,0.5);display:flex;align-items:center;justify-content:center;z-index:60;padding:20px;">
+      <div style="background:#fff;border-radius:14px;padding:20px;max-width:380px;width:100%;max-height:85vh;overflow-y:auto;">
+        <div style="font-weight:700;font-size:16px;margin-bottom:4px;color:var(--forest);">${escapeHtml(label)}</div>
+        <div style="font-size:12px;color:var(--sage);">Statut actuel : ${escapeHtml(m.status || 'active')}</div>
+        <div style="font-size:12px;color:var(--sage);margin-bottom:10px;">Catégorie : ${categoryLabel(m.category || 'amis')}</div>
+        <div style="font-size:12px;font-weight:700;color:var(--green);margin:10px 0 4px;">Changer la catégorie :</div>
+        ${categories.map((cat) => `<button type="button" data-set-category="${cat}" style="display:block;width:100%;text-align:left;padding:8px 6px;background:none;border:none;font-size:14px;cursor:pointer;">${categoryLabel(cat)}</button>`).join('')}
+        <hr style="border:none;border-top:1px solid #e5e0d5;margin:10px 0;" />
+        <div style="font-size:12px;font-weight:700;color:var(--green);margin-bottom:4px;">Changer le statut :</div>
+        ${statuses.map(([value, lbl]) => `<button type="button" data-set-status="${value}" ${isSelf ? 'disabled' : ''} style="display:block;width:100%;text-align:left;padding:8px 6px;background:none;border:none;font-size:14px;cursor:${isSelf ? 'not-allowed' : 'pointer'};color:${isSelf ? '#999' : 'var(--ink)'};">${lbl}</button>`).join('')}
+        ${isSelf ? `<div style="font-size:11px;color:var(--sage);margin-top:4px;">(Tu ne peux pas changer ton propre statut.)</div>` : ''}
+        <button type="button" id="statusModalClose" style="width:100%;margin-top:14px;padding:10px;border-radius:10px;border:1px solid #cfc9bd;background:#fff;cursor:pointer;">Fermer</button>
+      </div>
+    </div>
+  `;
+}
+
+function renderConfirmModal({ title, text, confirmId, cancelId, confirmLabel, busy }) {
+  return `
+    <div style="position:fixed;inset:0;background:rgba(0,0,0,0.5);display:flex;align-items:center;justify-content:center;z-index:70;padding:20px;">
+      <div style="background:#fff;border-radius:14px;padding:20px;max-width:360px;width:100%;">
+        <div style="font-weight:700;font-size:16px;margin-bottom:8px;color:var(--forest);">${escapeHtml(title)}</div>
+        <div style="font-size:13px;color:var(--ink);margin-bottom:16px;">${text}</div>
+        <div style="display:flex;gap:10px;">
+          <button type="button" id="${cancelId}" ${busy ? 'disabled' : ''} style="flex:1;padding:10px;border-radius:10px;border:1px solid #cfc9bd;background:#fff;cursor:pointer;">Annuler</button>
+          <button type="button" id="${confirmId}" ${busy ? 'disabled' : ''} style="flex:1;padding:10px;border-radius:10px;border:none;background:var(--error);color:#fff;cursor:pointer;">${escapeHtml(confirmLabel)}</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function renderConfirmRevokeModal(a) {
+  if (!a.confirmRevokeEmail) return '';
+  return renderConfirmModal({
+    title: "Révoquer l'invitation",
+    text: `Retirer « ${escapeHtml(a.confirmRevokeEmail)} » de la liste blanche ? Cette personne ne pourra plus créer de compte avec cet e-mail.`,
+    confirmId: 'confirmRevokeYes', cancelId: 'confirmRevokeNo', confirmLabel: 'Révoquer', busy: a.busy,
+  });
+}
+
+function renderConfirmDeleteConvModal(a) {
+  if (!a.confirmDeleteConvId) return '';
+  const c = (a.conversations || []).find((x) => x.id === a.confirmDeleteConvId);
+  return renderConfirmModal({
+    title: 'Supprimer définitivement',
+    text: `Supprimer « ${escapeHtml(c ? c.label : '')} » et tout son contenu (messages, médias) ? Irréversible.`,
+    confirmId: 'confirmDeleteConvYes', cancelId: 'confirmDeleteConvNo', confirmLabel: 'Supprimer', busy: a.busy,
+  });
+}
+
+function renderConfirmGlobalPurgeModal(a) {
+  if (!a.confirmGlobalPurge) return '';
+  return renderConfirmModal({
+    title: 'Purge globale',
+    text: `Supprimer DÉFINITIVEMENT tous les messages et médias de TOUTES les conversations, pour TOUS les membres ? Les conversations elles-mêmes restent (on peut recommencer à discuter dedans), mais tout l'historique disparaît. Cette action est irréversible.`,
+    confirmId: 'confirmGlobalPurgeYes', cancelId: 'confirmGlobalPurgeNo', confirmLabel: 'Purger tout', busy: a.busy,
+  });
+}
+
+function wireAdminEvents() {
+  const memberSearchInput = document.getElementById('memberSearchInput');
+  if (memberSearchInput) {
+    memberSearchInput.addEventListener('input', () => setAdmin({ memberSearch: memberSearchInput.value, memberShowCount: 10 }));
+  }
+  const memberShowMoreBtn = document.getElementById('memberShowMoreBtn');
+  if (memberShowMoreBtn) memberShowMoreBtn.addEventListener('click', () => setAdmin({ memberShowCount: state.admin.memberShowCount + 10 }));
+
+  document.querySelectorAll('[data-admin-member]').forEach((el) => {
+    el.addEventListener('click', () => setAdmin({ statusTargetId: el.dataset.adminMember }));
+  });
+
+  document.querySelectorAll('[data-revoke-email]').forEach((el) => {
+    el.addEventListener('click', () => setAdmin({ confirmRevokeEmail: el.dataset.revokeEmail }));
+  });
+
+  document.querySelectorAll('[data-jr-accept]').forEach((el) => {
+    el.addEventListener('click', async () => {
+      if (state.admin.busy) return;
+      setAdmin({ busy: true });
+      try {
+        await inviteEmailWeb(el.dataset.jrEmail);
+        await resolveJoinRequestWeb(el.dataset.jrAccept, true);
+      } catch (err) {
+        alert(err.message || String(err));
+      }
+      setAdmin({ busy: false });
+      await loadAdminData();
+    });
+  });
+  document.querySelectorAll('[data-jr-reject]').forEach((el) => {
+    el.addEventListener('click', async () => {
+      if (state.admin.busy) return;
+      setAdmin({ busy: true });
+      try { await resolveJoinRequestWeb(el.dataset.jrReject, false); } catch (_) {}
+      setAdmin({ busy: false });
+      await loadAdminData();
+    });
+  });
+
+  const convSearchInput = document.getElementById('convSearchInput');
+  if (convSearchInput) {
+    convSearchInput.addEventListener('input', () => setAdmin({ convSearch: convSearchInput.value, convShowCount: 10 }));
+  }
+  const convShowMoreBtn = document.getElementById('convShowMoreBtn');
+  if (convShowMoreBtn) convShowMoreBtn.addEventListener('click', () => setAdmin({ convShowCount: state.admin.convShowCount + 10 }));
+
+  document.querySelectorAll('[data-conv-archive]').forEach((el) => {
+    el.addEventListener('click', async () => {
+      if (state.admin.busy) return;
+      const id = el.dataset.convArchive;
+      const archived = el.dataset.convArchived === '1';
+      setAdmin({ busy: true });
+      try { await setConversationArchivedWeb(id, !archived); } catch (_) {}
+      setAdmin({ busy: false });
+      await loadAdminData();
+    });
+  });
+  document.querySelectorAll('[data-conv-delete]').forEach((el) => {
+    el.addEventListener('click', () => setAdmin({ confirmDeleteConvId: el.dataset.convDelete }));
+  });
+
+  const globalPurgeBtn = document.getElementById('globalPurgeBtn');
+  if (globalPurgeBtn) globalPurgeBtn.addEventListener('click', () => setAdmin({ confirmGlobalPurge: true }));
+
+  const statusModalClose = document.getElementById('statusModalClose');
+  if (statusModalClose) statusModalClose.addEventListener('click', () => setAdmin({ statusTargetId: null }));
+  document.querySelectorAll('[data-set-category]').forEach((el) => {
+    el.addEventListener('click', async () => {
+      const uid = state.admin.statusTargetId;
+      setAdmin({ statusTargetId: null, busy: true });
+      try { await setMemberCategoryWeb(uid, el.dataset.setCategory); } catch (_) {}
+      setAdmin({ busy: false });
+      await loadAdminData();
+    });
+  });
+  document.querySelectorAll('[data-set-status]').forEach((el) => {
+    el.addEventListener('click', async () => {
+      const uid = state.admin.statusTargetId;
+      setAdmin({ statusTargetId: null, busy: true });
+      try { await setMemberStatusWeb(uid, el.dataset.setStatus); } catch (_) {}
+      setAdmin({ busy: false });
+      await loadAdminData();
+    });
+  });
+
+  const confirmRevokeYes = document.getElementById('confirmRevokeYes');
+  if (confirmRevokeYes) confirmRevokeYes.addEventListener('click', async () => {
+    const email = state.admin.confirmRevokeEmail;
+    setAdmin({ confirmRevokeEmail: null, busy: true });
+    try { await revokeInviteWeb(email); } catch (_) {}
+    setAdmin({ busy: false });
+    await loadAdminData();
+  });
+  const confirmRevokeNo = document.getElementById('confirmRevokeNo');
+  if (confirmRevokeNo) confirmRevokeNo.addEventListener('click', () => setAdmin({ confirmRevokeEmail: null }));
+
+  const confirmDeleteConvYes = document.getElementById('confirmDeleteConvYes');
+  if (confirmDeleteConvYes) confirmDeleteConvYes.addEventListener('click', async () => {
+    const id = state.admin.confirmDeleteConvId;
+    setAdmin({ confirmDeleteConvId: null, busy: true });
+    try { await deleteConversationAdminWeb(id); } catch (_) {}
+    setAdmin({ busy: false });
+    await loadAdminData();
+  });
+  const confirmDeleteConvNo = document.getElementById('confirmDeleteConvNo');
+  if (confirmDeleteConvNo) confirmDeleteConvNo.addEventListener('click', () => setAdmin({ confirmDeleteConvId: null }));
+
+  const confirmGlobalPurgeYes = document.getElementById('confirmGlobalPurgeYes');
+  if (confirmGlobalPurgeYes) confirmGlobalPurgeYes.addEventListener('click', async () => {
+    setAdmin({ busy: true });
+    let n = 0;
+    try { n = await globalPurgeAllMessagesWeb(); } catch (_) {}
+    setAdmin({ busy: false, confirmGlobalPurge: false, purgeResult: `🧨 ${n} message(s) supprimé(s) sur toute la plateforme.` });
+    await loadAdminData();
+  });
+  const confirmGlobalPurgeNo = document.getElementById('confirmGlobalPurgeNo');
+  if (confirmGlobalPurgeNo) confirmGlobalPurgeNo.addEventListener('click', () => { if (!state.admin.busy) setAdmin({ confirmGlobalPurge: false }); });
 }
 
 // ---------- Démarrage ----------
