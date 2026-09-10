@@ -10,6 +10,62 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 const app = document.getElementById('app');
 
+// ---------- Cache local de l'identité déverrouillée (IndexedDB) ----------
+// Évite de resaisir la phrase secrète à chaque rechargement de page, comme l'app Android (dont la
+// clé privée vit dans l'Android Keystore, accessible sans re-saisie). Choix assumé par l'utilisateur
+// (07/09/2026) : la clé privée reste en clair dans le stockage du navigateur (protégé par l'origine
+// du site) plutôt qu'en mémoire JS seulement — acceptable pour un usage personnel sur son propre
+// appareil, comme le fait déjà l'app native.
+const IDENTITY_DB_NAME = 'breeze-identity';
+const IDENTITY_STORE = 'identities';
+
+function openIdentityDb() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(IDENTITY_DB_NAME, 1);
+    req.onupgradeneeded = () => {
+      req.result.createObjectStore(IDENTITY_STORE, { keyPath: 'userId' });
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function saveIdentityToCache(userId, identity) {
+  const db = await openIdentityDb();
+  await new Promise((resolve, reject) => {
+    const tx = db.transaction(IDENTITY_STORE, 'readwrite');
+    tx.objectStore(IDENTITY_STORE).put({ userId, ...identity });
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+  db.close();
+}
+
+async function loadIdentityFromCache(userId) {
+  const db = await openIdentityDb();
+  const row = await new Promise((resolve, reject) => {
+    const tx = db.transaction(IDENTITY_STORE, 'readonly');
+    const req = tx.objectStore(IDENTITY_STORE).get(userId);
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror = () => reject(req.error);
+  });
+  db.close();
+  if (!row) return null;
+  return { keyId: row.keyId, rawPrivateKey: row.rawPrivateKey, rawPublicKey: row.rawPublicKey };
+}
+
+async function clearIdentityCache(userId) {
+  if (!userId) return;
+  const db = await openIdentityDb();
+  await new Promise((resolve, reject) => {
+    const tx = db.transaction(IDENTITY_STORE, 'readwrite');
+    tx.objectStore(IDENTITY_STORE).delete(userId);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+  db.close();
+}
+
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => {
     navigator.serviceWorker.register('sw.js').catch(() => {});
@@ -234,6 +290,12 @@ async function loadMainData() {
       .maybeSingle();
     const { data: members } = await supabase.from('profiles').select('*');
     set({ profile: profile || null, members: members || [] });
+    if (!state.identity) {
+      try {
+        const cached = await loadIdentityFromCache(state.user.id);
+        if (cached) set({ identity: cached });
+      } catch (_) {}
+    }
     loadConversations();
   } catch (_) {
     set({ members: [] });
@@ -345,6 +407,7 @@ function wireUnlockEvents() {
     try {
       const identity = await restoreIdentityFromBackup(passphrase, state.profile.encrypted_private_key);
       set({ unlockBusy: false, identity });
+      try { await saveIdentityToCache(state.user.id, identity); } catch (_) {}
       if (state.conversations) decryptAllPreviews(state.conversations);
     } catch (err) {
       set({ unlockBusy: false, unlockError: err.message || 'Déverrouillage impossible.' });
@@ -423,6 +486,7 @@ function renderMain() {
   `;
 
   document.getElementById('signOutBtn').addEventListener('click', async () => {
+    try { await clearIdentityCache(state.user?.id); } catch (_) {}
     await supabase.auth.signOut();
   });
   wireUnlockEvents();
