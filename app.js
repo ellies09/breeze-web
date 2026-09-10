@@ -771,6 +771,12 @@ function closeConversation() {
 function renderConversation() {
   const conv = state.openConv;
   const msgs = state.messages;
+  // Reste collé en bas si l'utilisateur y était déjà avant ce re-rendu (ouverture, nouveau message
+  // reçu/envoyé, média qui finit de charger…) — sans ça chaque re-rendu (innerHTML reconstruit)
+  // remettait le défilement en haut. Ne force PAS le défilement si l'utilisateur a remonté lire
+  // l'historique.
+  const prevList = document.getElementById('msgList');
+  const stickToBottom = !prevList || (prevList.scrollHeight - prevList.scrollTop - prevList.clientHeight < 80);
   app.innerHTML = `
     <div class="topbar">
       <button id="backBtn" style="background:none;border:none;color:#fff;font-size:20px;cursor:pointer;padding:0 6px 0 0;">‹</button>
@@ -780,7 +786,7 @@ function renderConversation() {
         <button id="callVideoBtn" style="background:none;border:none;color:#fff;font-size:18px;cursor:pointer;padding:4px 8px;">🎥</button>
       ` : ''}
     </div>
-    <div style="flex:1;overflow-y:auto;padding:14px 16px;display:flex;flex-direction:column;gap:8px;">
+    <div id="msgList" style="flex:1;overflow-y:auto;padding:14px 16px;display:flex;flex-direction:column;gap:8px;">
       ${msgs === null ? `<div class="spinner"></div>` :
         msgs.length === 0 ? `<div class="empty">Aucun message. Écris le premier — il sera chiffré de bout en bout. 🔒</div>` :
         msgs.map((m) => `
@@ -820,6 +826,11 @@ function renderConversation() {
     </form>
     `}
   `;
+
+  if (stickToBottom) {
+    const list = document.getElementById('msgList');
+    if (list) list.scrollTop = list.scrollHeight;
+  }
 
   document.getElementById('backBtn').addEventListener('click', closeConversation);
   const callAudioBtn = document.getElementById('callAudioBtn');
