@@ -1336,6 +1336,85 @@ let callTickTimer = null;
 const callChannels = {}; // uid -> { channel, ready: Promise<channel> }
 let cachedTurnServers = [];
 
+// --- Tonalités d'appel (ringback sortant + sonnerie entrant), générées via Web Audio API : pas de
+// fichier audio à charger, et ça marche à l'identique sur tous les navigateurs. Miroir léger de
+// CallForegroundService côté Android (ToneGenerator/RingtoneManager), en plus simple ici puisqu'une
+// page web ne tourne jamais vraiment "en arrière-plan tuée" comme un process Android.
+let callAudioCtx = null;
+let ringbackTimer = null;
+let ringtoneTimer = null;
+
+function ensureCallAudioCtx() {
+  try {
+    if (!callAudioCtx) callAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (callAudioCtx.state === 'suspended') callAudioCtx.resume().catch(() => {});
+    return callAudioCtx;
+  } catch (_) {
+    return null;
+  }
+}
+// Débloque l'AudioContext dès la 1ʳᵉ interaction avec la page (politique autoplay des navigateurs,
+// en particulier iOS Safari) : sans ça, la sonnerie d'un appel entrant risquerait de rester
+// silencieuse si l'utilisateur n'a encore rien touché depuis l'ouverture de l'app.
+window.addEventListener('pointerdown', () => ensureCallAudioCtx(), { once: true, passive: true });
+
+function playCallTone(freqs, durationMs, gainValue = 0.18) {
+  const ctx = ensureCallAudioCtx();
+  if (!ctx) return;
+  try {
+    const now = ctx.currentTime;
+    const dur = durationMs / 1000;
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(0, now);
+    gain.gain.linearRampToValueAtTime(gainValue, now + 0.02);
+    gain.gain.setValueAtTime(gainValue, Math.max(now + 0.02, now + dur - 0.03));
+    gain.gain.linearRampToValueAtTime(0, now + dur);
+    gain.connect(ctx.destination);
+    freqs.forEach((f) => {
+      const osc = ctx.createOscillator();
+      osc.type = 'sine';
+      osc.frequency.value = f;
+      osc.connect(gain);
+      osc.start(now);
+      osc.stop(now + dur);
+    });
+  } catch (_) {}
+}
+
+/** Tonalité « ça sonne chez le correspondant » : double-ton téléphonique standard (440+480 Hz),
+ * rythme sonne 1s / silence 3s, jusqu'au décroché, au refus ou à la fin de l'appel. */
+function startRingback() {
+  stopRingback();
+  const cycle = () => {
+    playCallTone([440, 480], 1000);
+    ringbackTimer = setTimeout(cycle, 4000);
+  };
+  cycle();
+}
+function stopRingback() {
+  clearTimeout(ringbackTimer);
+  ringbackTimer = null;
+}
+
+/** Sonnerie d'appel entrant : deux impulsions rapprochées (« ring-ring »), puis silence, en boucle. */
+function startRingtone() {
+  stopRingtone();
+  const cycle = () => {
+    playCallTone([950, 1400], 400);
+    setTimeout(() => playCallTone([950, 1400], 400), 550);
+    ringtoneTimer = setTimeout(cycle, 3000);
+  };
+  cycle();
+}
+function stopRingtone() {
+  clearTimeout(ringtoneTimer);
+  ringtoneTimer = null;
+}
+function stopCallTones() {
+  stopRingback();
+  stopRingtone();
+}
+
 function callChannelFor(uid) {
   if (callChannels[uid]) return callChannels[uid].ready;
   const ch = supabase.channel('call-inbox-' + uid);
@@ -1380,8 +1459,9 @@ function onCallSignal(sig) {
     if (sig.groupId) return; // appels de groupe non pris en charge côté web
     if (call.status === 'idle') {
       call = { status: 'incoming', peerUid: sig.fromUid, peerName: sig.fromName, kind: sig.kind };
+      startRingtone();
       call.timeoutId = setTimeout(() => {
-        if (call.status === 'incoming') { call = { status: 'idle' }; renderCallOverlay(); }
+        if (call.status === 'incoming') { stopRingtone(); call = { status: 'idle' }; renderCallOverlay(); }
       }, CALL_RING_TIMEOUT_MS);
       renderCallOverlay();
     } else if (call.status === 'incoming' && call.peerUid === sig.fromUid) {
@@ -1394,6 +1474,7 @@ function onCallSignal(sig) {
   if (sig.type === 'accept') {
     if (call.status === 'outgoing' && call.peerUid === sig.fromUid) {
       clearTimeout(call.timeoutId);
+      stopRingback();
       call = { status: 'active', peerUid: call.peerUid, peerName: call.peerName, kind: call.kind, startedAt: Date.now(), micOn: true, camOn: call.kind === 'video', connected: false };
       renderCallOverlay();
       startWebRtc(true, call.kind, call.peerUid);
@@ -1411,6 +1492,7 @@ function onCallSignal(sig) {
   if (sig.type === 'cancel') {
     if (call.status === 'incoming') {
       clearTimeout(call.timeoutId);
+      stopRingtone();
       call = { status: 'idle' };
       renderCallOverlay();
     }
@@ -1428,6 +1510,7 @@ function onCallSignal(sig) {
 function startCall(peerUid, peerName, kind) {
   if (call.status !== 'idle' || !peerUid) return;
   call = { status: 'outgoing', peerUid, peerName, kind };
+  startRingback();
   sendCallSignal(makeSignal('invite', peerUid, kind));
   call.timeoutId = setTimeout(() => {
     if (call.status === 'outgoing') {
@@ -1441,6 +1524,7 @@ function startCall(peerUid, peerName, kind) {
 function acceptCall() {
   if (call.status !== 'incoming') return;
   clearTimeout(call.timeoutId);
+  stopRingtone();
   const { peerUid, peerName, kind } = call;
   call = { status: 'active', peerUid, peerName, kind, startedAt: Date.now(), micOn: true, camOn: kind === 'video', connected: false };
   renderCallOverlay();
@@ -1451,6 +1535,7 @@ function acceptCall() {
 function rejectCall() {
   if (call.status !== 'incoming') return;
   clearTimeout(call.timeoutId);
+  stopRingtone();
   const { peerUid, kind } = call;
   call = { status: 'idle' };
   renderCallOverlay();
@@ -1460,6 +1545,7 @@ function rejectCall() {
 function cancelOutgoingCall() {
   if (call.status !== 'outgoing') return;
   clearTimeout(call.timeoutId);
+  stopRingback();
   const { peerUid, kind } = call;
   stopWebRtc();
   call = { status: 'idle' };
@@ -1475,6 +1561,7 @@ function hangupCall() {
 }
 
 function endCall(reason) {
+  stopCallTones();
   stopWebRtc();
   call = { status: 'ended', reason };
   renderCallOverlay();
