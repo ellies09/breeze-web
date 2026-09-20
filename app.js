@@ -708,7 +708,11 @@ async function toDisplayMessage(m, key) {
     loadImage(m.id, m.media_path, key, 'video/mp4');
     return { id: m.id, mine, sentAt: m.sent_at, type: 'video' };
   }
-  if (m.type !== 'text') {
+  // "missed_call"/"call_log" : comme "text", le contenu déchiffré EST le libellé humain à afficher
+  // (ex. "📞 Appel terminé (2:15)") — seul le type sert à la notification push (qui ne peut pas
+  // déchiffrer). Seuls les types vraiment non pris en charge sur le web tombent dans le message
+  // générique ci-dessous.
+  if (m.type !== 'text' && m.type !== 'missed_call' && m.type !== 'call_log') {
     return { id: m.id, mine, sentAt: m.sent_at, text: previewLabelFor(m) + ' (non affiché sur le web pour l’instant)' };
   }
   try {
@@ -1445,6 +1449,69 @@ async function sendCallPush(toUid, kind) {
   } catch (_) {}
 }
 
+/** Formate une durée d'appel terminé en `m:ss`, ex. « 📞 Appel terminé (2:15) » — miroir de
+ * callCompletedLabel côté Android (Conversations.kt). */
+function callCompletedLabel(kind, durationMs) {
+  const totalSec = Math.max(0, Math.floor(durationMs / 1000));
+  const m = Math.floor(totalSec / 60);
+  const s = totalSec % 60;
+  const icon = kind === 'video' ? '📹' : '📞';
+  return `${icon} Appel terminé (${m}:${String(s).padStart(2, '0')})`;
+}
+
+/**
+ * Journalise un événement d'appel (terminé/refusé/annulé/occupé/manqué) comme message texte
+ * chiffré dans le DM avec [peerUid] — visible des deux côtés (message normal de la conversation
+ * partagée). Miroir de logCallEvent côté Android (Conversations.kt), mais SANS naviguer vers
+ * l'écran de conversation (contrairement à openOrCreateDmWeb, prévue pour un clic utilisateur).
+ * Un seul côté journalise chaque événement (voir les appels de cette fonction) pour éviter les
+ * doublons — l'appel étant un signal éphémère Realtime, rien d'autre ne fait foi de son issue.
+ */
+async function logCallEvent(peerUid, label, msgType = 'call_log') {
+  const me = state.user?.id;
+  if (!me || !peerUid) return;
+  try {
+    const { data: peer } = await supabase.from('profiles').select('*').eq('id', peerUid).maybeSingle();
+    if (!peer?.public_key) return;
+    let conv = (state.conversations || []).find((c) => c.otherUid === peerUid);
+    if (!conv) {
+      const dmKey = dmKeyOf(me, peerUid);
+      const { data: existing } = await supabase.from('conversations').select('*').eq('dm_key', dmKey).maybeSingle();
+      let convId, encryptedKeyRow;
+      if (existing) {
+        const { data: myMember } = await supabase.from('conversation_members')
+          .select('encrypted_key').eq('conversation_id', existing.id).eq('user_id', me).maybeSingle();
+        if (!myMember?.encrypted_key) return;
+        convId = existing.id;
+        encryptedKeyRow = myMember.encrypted_key;
+      } else {
+        const { keysetBinary } = newConversationKey();
+        const otherPub = parseTinkPublicKeyJson(peer.public_key);
+        const myWrapped = await wrapConversationKey(myPublicKeyInfo(), keysetBinary);
+        const otherWrapped = await wrapConversationKey(otherPub, keysetBinary);
+        const { data: convRow, error: convErr } = await supabase.from('conversations')
+          .insert({ type: 'direct', dm_key: dmKey, created_by: me }).select().single();
+        if (convErr) return;
+        const { error: memErr } = await supabase.from('conversation_members').insert([
+          { conversation_id: convRow.id, user_id: me, encrypted_key: myWrapped },
+          { conversation_id: convRow.id, user_id: peerUid, encrypted_key: otherWrapped },
+        ]);
+        if (memErr) return;
+        convId = convRow.id;
+        encryptedKeyRow = myWrapped;
+      }
+      conv = { id: convId, encryptedKey: encryptedKeyRow };
+    }
+    const key = await getConvKey(conv);
+    const ciphertext = await encryptMessage(key, label);
+    await supabase.from('messages').insert({ conversation_id: conv.id, sender_id: me, ciphertext, type: msgType });
+  } catch (_) {}
+}
+
+function missedCallLabel(kind) {
+  return kind === 'video' ? '📹 Appel vidéo manqué' : '📞 Appel manqué';
+}
+
 function makeSignal(type, toUid, kind, extra = {}) {
   return {
     type, fromUid: state.user.id, fromName: myDisplayName(), toUid, kind,
@@ -1498,7 +1565,12 @@ function onCallSignal(sig) {
     return;
   }
   if (sig.type === 'busy') {
-    if (call.status === 'outgoing') { clearTimeout(call.timeoutId); endCall('Occupé'); }
+    if (call.status === 'outgoing') {
+      clearTimeout(call.timeoutId);
+      const { peerUid, kind } = call;
+      endCall('Occupé');
+      logCallEvent(peerUid, kind === 'video' ? '📹 Occupé' : '📞 Occupé');
+    }
     return;
   }
   if (sig.type === 'cancel') {
@@ -1529,6 +1601,7 @@ function startCall(peerUid, peerName, kind) {
     if (call.status === 'outgoing') {
       sendCallSignal(makeSignal('cancel', peerUid, kind));
       endCall('Pas de réponse');
+      logCallEvent(peerUid, missedCallLabel(kind), 'missed_call');
     }
   }, CALL_RING_TIMEOUT_MS);
   renderCallOverlay();
@@ -1553,6 +1626,7 @@ function rejectCall() {
   call = { status: 'idle' };
   renderCallOverlay();
   sendCallSignal(makeSignal('reject', peerUid, kind));
+  logCallEvent(peerUid, kind === 'video' ? '📹 Appel vidéo refusé' : '📞 Appel refusé');
 }
 
 function cancelOutgoingCall() {
@@ -1564,13 +1638,19 @@ function cancelOutgoingCall() {
   call = { status: 'idle' };
   renderCallOverlay();
   sendCallSignal(makeSignal('cancel', peerUid, kind));
+  // Distinct du timeout de sonnerie ("manqué") : ici l'appelant raccroche lui-même avant toute
+  // réponse → "annulé", pour un historique précis (miroir d'Android, cancelOutgoing()).
+  logCallEvent(peerUid, kind === 'video' ? '📹 Appel vidéo annulé' : '📞 Appel annulé');
 }
 
 function hangupCall() {
   if (call.status !== 'active') return;
-  const { peerUid, kind } = call;
+  const { peerUid, kind, startedAt } = call;
+  const durationMs = Date.now() - startedAt;
   endCall('Appel terminé');
   sendCallSignal(makeSignal('end', peerUid, kind));
+  // Le camp qui raccroche journalise (l'autre reçoit juste le signal "end", pas de doublon).
+  logCallEvent(peerUid, callCompletedLabel(kind, durationMs));
 }
 
 function endCall(reason) {
