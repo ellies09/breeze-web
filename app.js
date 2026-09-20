@@ -1433,6 +1433,18 @@ async function sendCallSignal(signal) {
   } catch (_) {}
 }
 
+/** Réveille le destinataire même si son app Android est fermée/tuée (push FCM données-seules,
+ * même Edge Function que l'app Android — voir CallManager.startCall côté Android). Le seul
+ * broadcast Realtime ci-dessus ne suffit pas : il exige que le destinataire ait déjà une connexion
+ * Realtime active, donc son app déjà ouverte. */
+async function sendCallPush(toUid, kind) {
+  try {
+    await supabase.functions.invoke('call-push', {
+      body: { toUid, fromUid: state.user.id, fromName: myDisplayName(), kind },
+    });
+  } catch (_) {}
+}
+
 function makeSignal(type, toUid, kind, extra = {}) {
   return {
     type, fromUid: state.user.id, fromName: myDisplayName(), toUid, kind,
@@ -1512,6 +1524,7 @@ function startCall(peerUid, peerName, kind) {
   call = { status: 'outgoing', peerUid, peerName, kind };
   startRingback();
   sendCallSignal(makeSignal('invite', peerUid, kind));
+  sendCallPush(peerUid, kind);
   call.timeoutId = setTimeout(() => {
     if (call.status === 'outgoing') {
       sendCallSignal(makeSignal('cancel', peerUid, kind));
